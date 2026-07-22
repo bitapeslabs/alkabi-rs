@@ -16,6 +16,7 @@
 
 pub mod fit;
 pub mod host;
+pub mod list;
 pub mod synth;
 pub mod verify;
 
@@ -64,6 +65,13 @@ pub fn synthesize_one(
     arg_count: usize,
     config: &AnalysisConfig,
 ) -> Option<Plan> {
+    // Data-dependent list reads (a `.../length` + decimal-indexed elements,
+    // concatenated) have a variable key set the generic path rejects — try the
+    // dedicated list synthesizer first.
+    if let Some(plan) = list::try_list_plan(prober, opcode, arg_count, config) {
+        return Some(plan);
+    }
+
     let model = synth::discover_keys(prober, opcode, arg_count).ok()??;
 
     // Each value-width archetype is fit and verified against its own

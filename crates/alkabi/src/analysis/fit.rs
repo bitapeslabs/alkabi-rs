@@ -147,6 +147,15 @@ pub fn fit_expr(
         return None; // not enough signal
     }
 
+    // 0. Constant: every sample produces the same bytes regardless of storage,
+    //    height, or calldata (a pure constant view, e.g. get_decimals → [8]).
+    //    This is the ultimate fast path — no storage read at all. Verification
+    //    against fresh oracles guards against a false constant.
+    let first = &samples[0].output;
+    if samples.iter().all(|s| &s.output == first) {
+        return Some(BytesExpr::Const(first.clone()));
+    }
+
     // 1. Raw passthrough: response is exactly one key's stored bytes.
     for key in &model.keys {
         let pt = BytesExpr::Storage(Box::new(key_expr(key)));
@@ -169,6 +178,19 @@ pub fn fit_expr(
     let width = common_width(&samples)?;
     let mask = mask_for(width);
     let features = model.features();
+
+    // 2b. Numeric passthrough with default: `if the key is set, its value
+    //     re-encoded at the output width, else a constant`. (get_premium-style:
+    //     a scalar getter that reads the stored value as a u128 and returns a
+    //     hardcoded non-zero default when unset — distinct from raw passthrough
+    //     because the stored bytes are reinterpreted and re-widened.)
+    for key in &model.keys {
+        if let Some(expr) = fit_numeric_passthrough_default(key, &samples, width) {
+            if fits_all(&expr, &samples) {
+                return Some(expr);
+            }
+        }
+    }
 
     // Precompute masked feature values and masked targets per sample.
     let targets: Vec<u128> = samples
@@ -310,6 +332,58 @@ fn fit_passthrough_default(key: &KeyShape, samples: &[Sample]) -> Option<BytesEx
             Box::new(NumExpr::Const(0)),
         )),
         then: Box::new(BytesExpr::Storage(Box::new(key_expr(key)))),
+        r#else: Box::new(BytesExpr::Const(default)),
+    })
+}
+
+/// Fit `if len(storage(key)) > 0 then le(u(storage(key)), width) else CONST`.
+/// The stored value is reinterpreted as a u128 and re-encoded at the output
+/// width (so an 8-byte stored value becomes 16 output bytes), and the unset
+/// case returns a recovered constant default. Requires both branches observed.
+fn fit_numeric_passthrough_default(
+    key: &KeyShape,
+    samples: &[Sample],
+    width: u8,
+) -> Option<BytesExpr> {
+    let mut default: Option<Vec<u8>> = None;
+    let mut saw_nonempty = false;
+
+    for s in samples {
+        let kb = key_bytes(key, s);
+        if kb.is_empty() {
+            match &default {
+                None => default = Some(s.output.clone()),
+                Some(d) if d == &s.output => {}
+                Some(_) => return None,
+            }
+        } else {
+            // non-empty branch → output must equal le(u(stored), width)
+            let take = kb.len().min(16);
+            let mut buf = [0u8; 16];
+            buf[..take].copy_from_slice(&kb[..take]);
+            let n = u128::from_le_bytes(buf);
+            let encoded = n.to_le_bytes()[..width as usize].to_vec();
+            if s.output != encoded {
+                return None;
+            }
+            saw_nonempty = true;
+        }
+    }
+
+    let default = default?;
+    if !saw_nonempty {
+        return None;
+    }
+
+    Some(BytesExpr::If {
+        cond: Box::new(BoolExpr::Gt(
+            Box::new(NumExpr::Len(Box::new(BytesExpr::Storage(Box::new(key_expr(key)))))),
+            Box::new(NumExpr::Const(0)),
+        )),
+        then: Box::new(BytesExpr::Le {
+            of: Box::new(NumExpr::ULe(Box::new(BytesExpr::Storage(Box::new(key_expr(key)))))),
+            width,
+        }),
         r#else: Box::new(BytesExpr::Const(default)),
     })
 }

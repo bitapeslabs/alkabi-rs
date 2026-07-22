@@ -220,8 +220,15 @@ concolic probing**:
    whether keys are calldata-templated (recovered by diffing observed keys
    against the calldata bytes).
 3. **Value fitting**: vary stored values and height, fit the response with a
-   template library (passthrough, passthrough-with-default, fixed-width integer
-   projections, affine/ratio/sum/pairwise arithmetic), cheapest first.
+   template library (constant, passthrough, passthrough-with-default,
+   numeric-passthrough-with-default, fixed-width integer projections,
+   affine/ratio/sum/pairwise arithmetic), cheapest first. A pure-constant view
+   (e.g. `get_decimals → [8]`) fits `Const(bytes)` and needs no storage read at
+   all — zero RPC calls at runtime. A scalar getter that reinterprets its
+   stored value as a u128 and returns a non-zero default when unset
+   (`get_premium`) fits `if len(storage k)>0 then le(u(storage k), w) else
+   CONST` — distinct from raw passthrough-with-default because the stored bytes
+   are re-widened.
 4. **Verification**: a candidate ships only after reproducing the wasm
    byte-for-byte across many randomized trials (`--trials`, default 128).
 
@@ -234,9 +241,22 @@ bare passthrough. Methods that don't reduce simply get no plan and the consumer
 falls back to simulate; a plan is always an optimization, never load-bearing
 for correctness.
 
+**List reads** (`analysis/list.rs`) get a dedicated synthesizer, because their
+key set is data-dependent — the generic path rejects that. metashrew stores a
+list as a `{base}/length` (u32) key plus decimal-indexed `{base}/{i}` element
+keys; a view that concatenates one (e.g. frBTC's `get_pending_payments`) is
+recovered as a `loop` plan — `loop { count: u(storage(base ++ "/length")),
+body: storage(base ++ "/" ++ decimal(var)) }` — with the block height spliced
+into `base` when the list is keyed by height (`select_value(self.height())`).
+It's verified with oracles that populate real lists (random length + element
+values). Consumption fetches the length key first, then the element keys once
+the count is known (two `get_keys` rounds — the minimum, since element keys
+can't be named before the count is read).
+
 Verified live against deployed mainnet contracts never built with alkabi: the
 oyl-amm factory (`getNumPools`) and pool (`getName`, `getTotalFee`), and frbtc
-(`getName`, `getSymbol`, `getSigner`, `getTotalSupply`).
+(`getName`, `getSymbol`, `getSigner`, `getTotalSupply`, and the list-read
+`getPendingPayments`).
 
 Plans are **never** emitted by contracts (the derive always writes
 `plan: None`); they exist only as an extractor artifact.
