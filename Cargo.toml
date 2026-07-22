@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/alkabi",
+    "crates/alkabi-macros",
+    "crates/alkabi-extract",
+]
+default-members = [
+    "crates/alkabi",
+    "crates/alkabi-macros",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+# alkanes-rs at this tag pins metashrew by tag (v9.0.5-rc.8), so the whole
+# graph resolves deterministically from GitHub. Building metashrew-support
+# requires a `protoc` binary on PATH (or the PROTOC env var):
+# `apt install protobuf-compiler`, same prerequisite as espo/tacoclicker.
+[workspace.dependencies]
+anyhow = "1.0"
+borsh = { version = "1.5.7", features = ["derive"] }
+bitcoin = "0.32.4"
+alkanes-support = { git = "https://github.com/kungfuflex/alkanes-rs", tag = "v2.2.1-alpha.1" }
+alkanes-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", tag = "v2.2.1-alpha.1" }
+metashrew-support = { git = "https://github.com/sandshrewmetaprotocols/metashrew", tag = "v9.0.5-rc.8" }

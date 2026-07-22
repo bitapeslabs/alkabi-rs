@@ -1,0 +1,28 @@
+[package]
+name = "alkabi"
+version.workspace = true
+edition.workspace = true
+description = "Self-describing ABI generation for alkanes contracts"
+
+[features]
+default = []
+# Host-side ABI extraction: wasm bytes -> AlkabiAbi. Never enable in contract
+# builds; it pulls a wasm interpreter and serde_json.
+extract = ["dep:wasmi", "dep:serde_json"]
+
+[dependencies]
+anyhow = { workspace = true }
+borsh = { workspace = true }
+bitcoin = { workspace = true }
+alkanes-support = { workspace = true }
+alkanes-runtime = { workspace = true }
+metashrew-support = { workspace = true }
+alkabi-macros = { path = "../alkabi-macros" }
+wasmi = { version = "0.40", optional = true }
+# preserve_order: borsh struct field order is wire-significant.
+# arbitrary_precision: opcodes are u128 and must survive JSON round-trips.
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"], optional = true }
+
+[dev-dependencies]
+# Self-dependency so `cargo test` always runs the extract tests.
+alkabi = { path = ".", features = ["extract"] }

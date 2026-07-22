@@ -1,0 +1,13 @@
+[package]
+name = "alkabi-macros"
+version.workspace = true
+edition.workspace = true
+description = "Derive macros for alkabi"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

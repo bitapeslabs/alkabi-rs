@@ -1,0 +1,9 @@
+[package]
+name = "alkabi-extract"
+version.workspace = true
+edition.workspace = true
+description = "Extract an alkabi ABI (abi.json + abi.ts) from a compiled alkanes contract wasm"
+
+[dependencies]
+anyhow = { workspace = true }
+alkabi = { path = "../alkabi", features = ["extract"] }
