@@ -513,6 +513,8 @@ fn method_expr(v: &VariantInfo) -> TokenStream {
             input: #input,
             witness: #witness,
             output: #output,
+            // Plans are extractor artifacts (wasm analysis), never contract-emitted.
+            plan: ::core::option::Option::None,
         }
     }
 }

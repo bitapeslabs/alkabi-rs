@@ -4,6 +4,7 @@
 //!
 //! Usage: alkabi-extract <contract.wasm> [-o <out-dir>]   (out-dir defaults to ./abis)
 
+use alkabi::analysis::{attach_plans, AnalysisConfig};
 use alkabi::extract::{extract_meta_bytes, parse_abi_json};
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -12,6 +13,8 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut wasm_path: Option<PathBuf> = None;
     let mut out_dir = PathBuf::from("abis");
+    let mut plans = false;
+    let mut trials: u32 = AnalysisConfig::default().verify_trials;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -19,8 +22,22 @@ fn main() -> Result<()> {
                 let value = args.next().context("-o requires a directory argument")?;
                 out_dir = PathBuf::from(value);
             }
+            "--plans" => {
+                plans = true;
+            }
+            "--trials" => {
+                let value = args.next().context("--trials requires a number")?;
+                trials = value.parse().context("--trials must be a number")?;
+                plans = true;
+            }
             "-h" | "--help" => {
-                eprintln!("Usage: alkabi-extract <contract.wasm> [-o <out-dir>]");
+                eprintln!(
+                    "Usage: alkabi-extract <contract.wasm> [-o <out-dir>] [--plans] [--trials N]\n\
+                     \n\
+                     --plans      synthesize verified view plans (static fast-path) from the wasm\n\
+                     --trials N   randomized verification trials per plan (default {}); implies --plans",
+                    AnalysisConfig::default().verify_trials,
+                );
                 return Ok(());
             }
             other => {
@@ -38,13 +55,44 @@ fn main() -> Result<()> {
 
     let meta = extract_meta_bytes(&wasm)?;
     let json = std::str::from_utf8(&meta).context("__meta returned invalid UTF-8")?;
-    let (abi, normalized) = parse_abi_json(json)?;
+    let (mut abi, normalized) = parse_abi_json(json)?;
 
     if normalized {
         eprintln!(
             "note: {} reports the upstream (pre-alkabi) ABI format; normalizing. \
              view/execute kinds are heuristic (get_* => view) — verify them.",
             abi.contract
+        );
+    }
+
+    if plans {
+        let config = AnalysisConfig {
+            verify_trials: trials,
+            ..AnalysisConfig::default()
+        };
+        eprintln!(
+            "analyzing {} view methods for static plans ({} verification trials each)...",
+            abi.methods
+                .iter()
+                .filter(|m| m.kind == alkabi::abi::MethodKind::View)
+                .count(),
+            trials,
+        );
+        attach_plans(&mut abi, &wasm, &config)?;
+        let planned: Vec<&str> = abi
+            .methods
+            .iter()
+            .filter(|m| m.plan.is_some())
+            .map(|m| m.name.as_str())
+            .collect();
+        eprintln!(
+            "synthesized {} verified plan(s): {}",
+            planned.len(),
+            if planned.is_empty() {
+                "(none)".to_string()
+            } else {
+                planned.join(", ")
+            },
         );
     }
 

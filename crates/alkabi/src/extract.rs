@@ -206,10 +206,18 @@ fn parse_method(value: &Value) -> Result<AbiMethod> {
         }
     };
 
+    let plan = match value.get("plan") {
+        None => None,
+        Some(plan) => Some(
+            crate::plan::parse_plan(plan).with_context(|| format!("method {} plan", name))?,
+        ),
+    };
+
     Ok(AbiMethod {
         input: parse_io("input")?,
         witness: parse_io("witness")?,
         output: parse_io("output")?,
+        plan,
         name,
         opcode,
         kind,
@@ -361,6 +369,7 @@ fn normalize_upstream(value: &Value) -> Result<AbiDocument> {
             input,
             witness: None,
             output,
+            plan: None,
         });
     }
 

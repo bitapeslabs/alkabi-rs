@@ -1,5 +1,6 @@
 //! The alkabi ABI document: what `export_abi()` serializes and `__meta` exposes.
 
+use crate::plan::Plan;
 use crate::schema::{write_json_string, Schema, TypeRegistry};
 
 pub const ALKABI_VERSION: u32 = 1;
@@ -76,6 +77,10 @@ pub struct AbiMethod {
     pub witness: Option<AbiIo>,
     /// None means void / no declared return.
     pub output: Option<AbiIo>,
+    /// A verified pure-expression plan reproducing this view's response data
+    /// from storage keys alone (no execution). Synthesized by the extractor's
+    /// wasm analysis — never emitted by contracts themselves.
+    pub plan: Option<Plan>,
 }
 
 impl AbiMethod {
@@ -98,6 +103,10 @@ impl AbiMethod {
         if let Some(output) = &self.output {
             out.push_str(",\"output\":");
             output.write_json(out);
+        }
+        if let Some(plan) = &self.plan {
+            out.push_str(",\"plan\":");
+            plan.write_json(out);
         }
         out.push('}');
     }

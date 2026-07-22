@@ -12,10 +12,13 @@
 
 pub mod abi;
 pub mod abi_return;
+#[cfg(feature = "extract")]
+pub mod analysis;
 pub mod borsh_io;
 #[cfg(feature = "extract")]
 pub mod extract;
 pub mod legacy;
+pub mod plan;
 pub mod schema;
 pub mod types;
 pub mod witness;

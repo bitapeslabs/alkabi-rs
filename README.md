@@ -208,7 +208,21 @@ cargo install --git https://github.com/bitapeslabs/alkabi-rs alkabi-extract
 
 alkabi-extract path/to/contract.wasm            # writes ./abis/abi.json + abi.ts
 alkabi-extract path/to/contract.wasm -o my-dir  # custom output directory
+alkabi-extract path/to/contract.wasm --plans    # + synthesize verified view plans
 ```
+
+### View plans (static simulate fast-path)
+
+`--plans` statically analyzes the wasm and attaches a verified `plan` to each
+view method it can reduce to a pure expression over storage keys, calldata, and
+block height — so a consumer holding the contract's storage (e.g. an indexer's
+batched `get_keys`) can evaluate it instead of simulating, which is orders of
+magnitude faster. It works on any deployed contract with a `__meta` export,
+alkabi-built or not; a plan ships only after reproducing the bytecode across
+many randomized trials (`--trials N`, default 128), and methods that don't
+reduce simply fall back to simulate. See [DESIGN.md](DESIGN.md) for the plan
+grammar and the synthesis pipeline. The library API is
+`alkabi::analysis::attach_plans(&mut abi, &wasm, &config)`.
 
 `abi.json` is the pretty-printed document; `abi.ts` is the same object as an
 `export const ... as const` — the literal-typed form a TypeScript consumer

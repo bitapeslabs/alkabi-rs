@@ -181,6 +181,83 @@ Omitted `input`/`output` mean no calldata / void. `witness` (always mode
 `borsh`) describes a payload in the reveal transaction's witness envelope; it
 composes with `input` — a method may take calldata and witness data at once.
 
+## View plans (static simulate fast-path)
+
+Many view methods just read one or more storage keys and do a little pure math
+(`get_symbol` returns a key or a default; `get_counter` returns a u64 key;
+`get_reserves` reads two keys; an average is `(k1 + k2) / 2`). Simulating them
+runs the whole wasm; evaluating a recovered expression against a batched
+storage read (e.g. an indexer's `get_keys`) is orders of magnitude faster.
+
+Extraction with `--plans` synthesizes, **from the wasm alone**, a verified
+`plan` on each view method it can reduce — no contract cooperation, works on
+already-deployed contracts:
+
+```jsonc
+{ "name": "getCounter", "opcode": 104, "kind": "view",
+  "output": { "mode": "raw", "schema": "u64" },
+  "plan": { "v": 1, "trials": 256,
+            "expr": { "le": { "of": { "u": { "storage": { "bytes": "2f636f756e746572" } } }, "width": 8 } } } }
+```
+
+The plan grammar (`alkabi::plan`) is three expression kinds — **bytes**
+(`storage(keyExpr)`, `calldata{start,len}`, `concat`, `slice`, `le{of,width}`,
+`if`, `loop`, `hex`, `decimal`, const `bytes`), **num** (`num`, `word i`,
+`u`(LE uint of bytes), `len`, `height`, `var`, `add/sub/mul/div/mod`), and
+**bool** (`eq/ne/lt/lte/gt/gte`, `beq`, `and/or/not`). Keys may be constants or
+templates that splice a calldata slice in (`"/user/" ++ calldata[0..32]` for an
+address-keyed getter). All numbers are u128 with wrapping arithmetic; a missing
+key reads as zero-length.
+
+How synthesis works (`alkabi::analysis`, feature `extract`) — **differential
+concolic probing**:
+
+1. A probe host runs `__execute` in wasmi as a mini-indexer under full oracle
+   control (we supply context, storage, height), recording every key requested
+   and the response. Any method that reaches out beyond storage/height/calldata
+   — extcalls, tx/block access, balances — is disqualified.
+2. **Key discovery**: probe with varied calldata to learn the key set and
+   whether keys are calldata-templated (recovered by diffing observed keys
+   against the calldata bytes).
+3. **Value fitting**: vary stored values and height, fit the response with a
+   template library (passthrough, passthrough-with-default, fixed-width integer
+   projections, affine/ratio/sum/pairwise arithmetic), cheapest first.
+4. **Verification**: a candidate ships only after reproducing the wasm
+   byte-for-byte across many randomized trials (`--trials`, default 128).
+
+Soundness is the verification step: the synthesizer may propose anything, but
+nothing survives that disagrees with the bytecode. Verification draws storage
+values from the width distribution alkanes actually writes (unset / u64 / u128
+integers, or UTF-8 blobs) — crucially including the **empty/unset** case, which
+is what forces a default-fallback branch to be modeled rather than mis-fit as a
+bare passthrough. Methods that don't reduce simply get no plan and the consumer
+falls back to simulate; a plan is always an optimization, never load-bearing
+for correctness.
+
+Verified live against deployed mainnet contracts never built with alkabi: the
+oyl-amm factory (`getNumPools`) and pool (`getName`, `getTotalFee`), and frbtc
+(`getName`, `getSymbol`, `getSigner`, `getTotalSupply`).
+
+Plans are **never** emitted by contracts (the derive always writes
+`plan: None`); they exist only as an extractor artifact.
+
+**TS consumption (wired):** alkanesjs ports the evaluator to
+`src/libs/alkabi/plan.ts`; when a view carries a plan and the provider has an
+`espoUrl`, `AlkanesContract` collects the plan's storage keys, fetches them in
+one batched espo `get_keys` call, evaluates the plan locally, and decodes with
+the method's normal output codec — instead of `simulate`. Key collection
+explores **every branch** (both arms of an `if`, all operands of `and`/`or`),
+so a conditional like `if s(k1)==2 { s(k2) } else { s(k3) }` fetches k1/k2/k3 in
+a single `get_keys`; only a key whose *bytes* depend on an unfetched value
+(`s(s(k))`) defers to another round, and the caller loops to a fixpoint so
+nested-key plans still resolve in the minimum number of round-trips. Height-using plans
+fetch the indexer tip via `metashrew_height`. Any failure (no espo, RPC error,
+eval error) falls back to the authoritative simulate path, so a plan is never
+load-bearing. Verified live on mainnet clock-in (2:21568): `getCounter`,
+`getName`, `getSymbol` each ran one `get_keys` and zero `simulate`, `getHeight`
+ran neither storage read nor simulate, and all four matched a real simulate
+exactly.
+
 ## Version pins
 
 Espo-style GitHub tag pins, no patches or vendoring:
