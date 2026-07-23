@@ -333,20 +333,51 @@ impl<'a> Interp<'a> {
 
     fn recover_num(&self, addr: u32, width: u32) -> Option<Rc<SymNum>> {
         let first = self.tags.get(&addr)?;
-        if first.index != 0 {
-            return None;
-        }
+        // Byte index of this load within its source. Non-zero means we're
+        // reading an interior/high slice of a wider value — e.g. the high 64
+        // bits of a u128 read as two i64 words. That must stay symbolic (a
+        // shift of the whole), not collapse to a concrete high word.
+        let start = first.index;
         let src = first.src.clone();
+        // Require a contiguous run [addr, addr+width) from one source with
+        // consecutive indices start .. start+width.
         for j in 1..width {
             let p = self.tags.get(&(addr + j))?;
-            if !Rc::ptr_eq(&p.src, &src) || p.index != j {
+            if !Rc::ptr_eq(&p.src, &src) || p.index != start + j {
                 return None;
             }
         }
-        match &*src {
-            SymBytes::Le { of, width: sw } if *sw as u32 == width => Some(of.clone()),
-            SymBytes::Storage(_) => Some(SymNum::ULe(src.clone()).rc()),
-            _ => None,
+        // Does the SAME source continue immediately past the load? If so this is
+        // a low/interior slice of a wider value and its excess-high bits must be
+        // masked off; if not, the load reaches the value's tail.
+        let more_after = self
+            .tags
+            .get(&(addr + width))
+            .is_some_and(|p| Rc::ptr_eq(&p.src, &src) && p.index == start + width);
+
+        // The symbolic number for the WHOLE source value.
+        let full: Rc<SymNum> = match &*src {
+            SymBytes::Le { of, width: sw } => {
+                // A full, aligned reload of a stored value is just that value.
+                if start == 0 && width == *sw as u32 && !more_after {
+                    return Some(of.clone());
+                }
+                of.clone()
+            }
+            SymBytes::Storage(_) => SymNum::ULe(src.clone()).rc(),
+            _ => return None,
+        };
+        // Bytes [start, start+width) = (full >> start*8) & (2^(width*8) - 1).
+        let shifted = if start == 0 {
+            full
+        } else {
+            SymNum::Shr(full, SymNum::Const(start as u128 * 8).rc()).rc()
+        };
+        if more_after && width < 16 {
+            let mask = (1u128 << (width * 8)) - 1;
+            Some(SymNum::And(shifted, SymNum::Const(mask).rc()).rc())
+        } else {
+            Some(shifted)
         }
     }
 
