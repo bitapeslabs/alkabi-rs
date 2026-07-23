@@ -61,6 +61,7 @@ impl<'a> Interp<'a> {
                         bail!("unsupported: multivalue if params");
                     }
                     let cond = pop!();
+                    self.record_branch(&cond, cond.c & 0xffff_ffff != 0);
                     cs.push(Ctrl {
                         end: ends[&pc],
                         cont: ends[&pc] + 1,
@@ -103,7 +104,9 @@ impl<'a> Interp<'a> {
                 }
                 Operator::BrIf { relative_depth } => {
                     let c = pop!();
-                    if c.c & 0xffff_ffff != 0 {
+                    let taken = c.c & 0xffff_ffff != 0;
+                    self.record_branch(&c, taken);
+                    if taken {
                         self.do_branch(*relative_depth as usize, &mut vs, &mut cs, &mut pc);
                         continue;
                     }

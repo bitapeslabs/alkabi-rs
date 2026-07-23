@@ -98,19 +98,22 @@ pub fn synthesize_one(
     // Last resort: symbolically lift the wasm computation directly. Covers
     // arbitrary straight-line pure arithmetic the templates don't (halvings,
     // bit math, packed layouts). Verbose but correct; verified like the rest.
-    if let Some(lifted) = lift_module.and_then(|m| lift::lift_view(m, opcode, arg_count)) {
-        if let Some(trials) = lift::verify_lifted(
-            prober,
-            opcode,
-            arg_count,
-            &lifted,
-            config.verify_trials,
-            config.verify_seed ^ opcode as u64 ^ 0x11f7,
-        ) {
-            return Some(Plan {
-                expr: lifted,
-                trials,
-            });
+    if let Some(m) = lift_module {
+        for (lifted, widths) in lift::lift_view(m, opcode, arg_count) {
+            if let Some(trials) = lift::verify_lifted(
+                prober,
+                opcode,
+                arg_count,
+                &lifted,
+                config.verify_trials,
+                config.verify_seed ^ opcode as u64 ^ 0x11f7,
+                &widths,
+            ) {
+                return Some(Plan {
+                    expr: lifted,
+                    trials,
+                });
+            }
         }
     }
     None

@@ -72,7 +72,17 @@ pub struct Interp<'a> {
     /// key SymBytes remembered between __request_storage and __load_storage
     pending_key: Option<Rc<SymBytes>>,
     disq: Option<&'static str>,
+    /// Control-flow branch predicates taken this run, in order — recorded at
+    /// every `if`/`br_if` whose condition carried a symbolic bool. Multiple runs
+    /// over different oracle worlds take different branches; comparing their
+    /// (predicate, taken) traces is what lets the driver merge divergent paths
+    /// into a single `if(cond, …)` plan.
+    path: Vec<(Rc<SymBool>, bool)>,
 }
+
+/// Cap on recorded branch predicates — guards against a symbolic byte-validation
+/// loop flooding the trace; real view divergences sit well under this.
+const MAX_PATH: usize = 64;
 
 /// One entry per structural control block, for branch resolution.
 struct Ctrl {
@@ -103,6 +113,23 @@ impl<'a> Interp<'a> {
             max_steps,
             pending_key: None,
             disq: None,
+            path: Vec::new(),
+        }
+    }
+
+    /// The branch predicates taken this run (see [`Interp::path`]).
+    pub fn take_path(&mut self) -> Vec<(Rc<SymBool>, bool)> {
+        std::mem::take(&mut self.path)
+    }
+
+    /// Record a taken branch if its condition was symbolic (concrete branches
+    /// are world-invariant and carry no plan information).
+    fn record_branch(&mut self, cond: &Value, taken: bool) {
+        if self.path.len() >= MAX_PATH {
+            return;
+        }
+        if let Some(b) = &cond.b {
+            self.path.push((b.clone(), taken));
         }
     }
 

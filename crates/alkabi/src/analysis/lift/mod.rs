@@ -15,9 +15,21 @@ pub mod sym;
 
 use super::host::{Oracle, Outcome, Prober};
 use super::synth::Rng;
-use crate::plan::{eval_bytes, BytesExpr, PlanEnv};
+use crate::plan::{eval_bytes, BoolExpr, BytesExpr, PlanEnv};
 use interp::{Interp, LiftEnv, LiftOutcome};
 use module::Module;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+/// Per-key storage value width (in bytes) discovered during lifting. Alkanes
+/// contracts store scalars as fixed-width little-endian; a `u64`-typed key
+/// deserialized from a 16-byte value (or a `u128` key from 8 bytes) hits a
+/// `try_into().unwrap()` panic. The discovered widths let both the lifter and
+/// the verifier hand each key a value it can actually decode.
+pub type Widths = HashMap<Vec<u8>, usize>;
+
+/// Storage scalar widths to try per key, most common first (`u128`, then `u64`).
+const WIDTH_CANDIDATES: [usize; 2] = [16, 8];
 
 /// The default oracle world for a lifting run: fixed context, and storage that
 /// returns a fixed non-empty 16-byte value for every key (so "value present"
@@ -37,39 +49,249 @@ fn context_bytes(opcode: u128, arg_count: usize) -> (Vec<u8>, usize) {
     (bytes, calldata_off)
 }
 
-/// Attempt to lift a plan for `opcode`. Returns the raw (unverified) BytesExpr;
-/// the caller must verify it against the wasm before shipping.
+/// Attempt to lift a plan for `opcode`. Returns the raw (unverified) BytesExpr
+/// alongside the per-key storage widths it was lifted under (which the verifier
+/// must reuse); the caller must verify the expr against the wasm before shipping.
 ///
-/// A few storage-value strategies are tried in turn: for straight-line code the
-/// symbolic result is identical regardless, but a view that panics on some
-/// concrete values (e.g. an emission-table index that overflows when a stored
-/// height is far from the tip) may lift cleanly under a different world.
-pub fn lift_view(module: &Module, opcode: u128, arg_count: usize) -> Option<BytesExpr> {
+/// The lifter runs the view concretely under many oracle *worlds* and merges the
+/// results:
+///
+/// * **Per-key widths** are discovered greedily — every key starts at 16 bytes,
+///   and a trap right after a key is read narrows it to 8 (a `u64` decoded from
+///   16 bytes panics in the contract's deserializer). This alone is what lets
+///   multi-scalar views — genesis(u64), epoch(u128), … — execute at all.
+/// * **Branch merging**: different worlds take different control-flow branches
+///   (e.g. a saturating/clamped path vs. the live path). Each run records the
+///   symbolic predicates it branched on; [`merge_observations`] stitches runs
+///   that diverge on one predicate into `if(pred, then, else)`. This recovers
+///   views whose value depends on a `br_if`, not just a branchless `select`.
+pub fn lift_view(module: &Module, opcode: u128, arg_count: usize) -> Vec<(BytesExpr, Widths)> {
+    let (obs, widths) = collect_observations(module, opcode, arg_count);
+    if obs.is_empty() {
+        return Vec::new();
+    }
+
+    // Candidate plans, in the order the caller should try to verify them:
+    //   1. each distinct single-world lift, most-frequently-observed first — a
+    //      straight-line view lifts identically everywhere, so its one expr sits
+    //      at the front and verifies immediately (this is the common case);
+    //   2. the branch-merged expr, if the divergent worlds stitch together — the
+    //      fallback for views whose value genuinely depends on a `br_if`.
+    // Verification downstream rejects any candidate that doesn't match the wasm,
+    // so a mis-fold in one world simply loses to a better candidate.
+    let mut freq: Vec<(BytesExpr, usize)> = Vec::new();
+    for (_, expr) in &obs {
+        match freq.iter_mut().find(|(e, _)| e == expr) {
+            Some((_, n)) => *n += 1,
+            None => freq.push((expr.clone(), 1)),
+        }
+    }
+    freq.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut candidates: Vec<(BytesExpr, Widths)> = Vec::new();
+    for (expr, _) in freq.into_iter().take(6) {
+        candidates.push((sym::simplify_bytes(expr), widths.clone()));
+    }
+    if let Some(merged) = merge_observations(&obs, 0) {
+        let merged = sym::simplify_bytes(merged);
+        if !candidates.iter().any(|(e, _)| *e == merged) {
+            candidates.push((merged, widths.clone()));
+        }
+    }
+    candidates
+}
+
+/// Run the view under many oracle worlds (see [`lift_view`]) and return every
+/// `(predicate trace, lifted expr)` observation plus the discovered per-key
+/// widths. Widths persist across worlds so a narrowing found on one run carries
+/// into the next.
+fn collect_observations(
+    module: &Module,
+    opcode: u128,
+    arg_count: usize,
+) -> (Vec<(Vec<(BoolExpr, bool)>, BytesExpr)>, Widths) {
     const HEIGHT: u64 = 880_001;
-    // each strategy maps a requested key to a concrete value
-    let strategies: [fn(&[u8]) -> Vec<u8>; 4] = [
-        |_| 7u128.to_le_bytes().to_vec(),
-        |_| 1u128.to_le_bytes().to_vec(),
-        // values near the tip — avoids "blocks since genesis" overflow traps
-        |_| (HEIGHT as u128 - 10).to_le_bytes().to_vec(),
-        |_| 0u128.to_le_bytes().to_vec(),
+    let widths: RefCell<Widths> = RefCell::new(HashMap::new());
+    let cand_idx: RefCell<HashMap<Vec<u8>, usize>> = RefCell::new(HashMap::new());
+    let mut obs: Vec<(Vec<(BoolExpr, bool)>, BytesExpr)> = Vec::new();
+
+    // 1) Uniform archetypes — every key the same value. Small values drive the
+    //    "far below tip" / clamped branches; near-tip values drive the live path.
+    let archetypes: [u128; 6] = [
+        7,
+        1,
+        0,
+        HEIGHT as u128 - 10,
+        HEIGHT as u128 - 105_000,
+        HEIGHT as u128 / 2,
     ];
-    for storage in strategies {
+    for &base in &archetypes {
+        if let Some(o) = run_world(module, opcode, arg_count, HEIGHT, |_| base, &widths, &cand_idx) {
+            obs.push(o);
+        }
+    }
+    // 2) Per-key varied worlds — distinct keys get distinct pseudo-random values
+    //    (and a few heights), so key-vs-key comparisons flip both ways across
+    //    worlds and the merge can see each side of a branch.
+    for salt in 0..16u64 {
+        let height = [HEIGHT, 200_000, 1_000_000, 50_000][(salt % 4) as usize];
+        if let Some(o) = run_world(
+            module,
+            opcode,
+            arg_count,
+            height,
+            |key| key_value(key, salt, height),
+            &widths,
+            &cand_idx,
+        ) {
+            obs.push(o);
+        }
+    }
+    let discovered = widths.borrow().clone();
+    (obs, discovered)
+}
+
+/// Run one oracle world with greedy per-key width discovery. Returns the lifted
+/// `BytesExpr` and the (lowered) predicate trace, or `None` if the run can't be
+/// made to complete-and-lower under any width assignment.
+fn run_world<F: Fn(&[u8]) -> u128>(
+    module: &Module,
+    opcode: u128,
+    arg_count: usize,
+    height: u64,
+    value_of: F,
+    widths: &RefCell<Widths>,
+    cand_idx: &RefCell<HashMap<Vec<u8>, usize>>,
+) -> Option<(Vec<(BoolExpr, bool)>, BytesExpr)> {
+    let order: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::new());
+    let max_attempts = 2 * WIDTH_CANDIDATES.len() + 12;
+    for _ in 0..max_attempts {
+        order.borrow_mut().clear();
+        let storage = |key: &[u8]| -> Vec<u8> {
+            order.borrow_mut().push(key.to_vec());
+            let w = widths
+                .borrow()
+                .get(key)
+                .copied()
+                .unwrap_or(WIDTH_CANDIDATES[0]);
+            value_of(key).to_le_bytes()[..w.min(16)].to_vec()
+        };
         let (context, calldata_off) = context_bytes(opcode, arg_count);
         let env = LiftEnv {
             context,
             calldata_off,
-            height: HEIGHT,
+            height,
             storage: &storage,
         };
         let mut interp = Interp::new(module, &env, 5_000_000);
-        if let LiftOutcome::Data(sym) = interp.run_execute() {
-            if let Some(expr) = sym.lower().map(sym::simplify_bytes) {
-                return Some(expr);
+        match interp.run_execute() {
+            LiftOutcome::Data(sym) => {
+                let expr = sym::simplify_bytes(sym.lower()?);
+                // lower the predicate trace, dropping any predicate the plan IR
+                // can't express (it can't be a merge split point anyway).
+                let path: Vec<(BoolExpr, bool)> = interp
+                    .take_path()
+                    .into_iter()
+                    .filter_map(|(b, t)| b.lower().map(|be| (be, t)))
+                    .collect();
+                return Some((path, expr));
             }
+            LiftOutcome::Trap(_) => {
+                // Narrow the width of the key read just before the trap — a
+                // fixed-width deserializer panics immediately after its read.
+                let k = order.borrow().last().cloned()?;
+                let next = cand_idx.borrow().get(&k).map_or(1, |i| i + 1);
+                match WIDTH_CANDIDATES.get(next) {
+                    Some(&w) => {
+                        cand_idx.borrow_mut().insert(k.clone(), next);
+                        widths.borrow_mut().insert(k, w);
+                    }
+                    None => return None, // exhausted widths → value trap, not width
+                }
+            }
+            _ => return None, // Disqualified / Unsupported: retrying won't help
         }
     }
     None
+}
+
+/// Deterministic pseudo-random per-key value biased toward realistic magnitudes:
+/// sometimes just below the tip (so a genesis/height-typed key yields a small,
+/// live epoch), sometimes small, sometimes spread across the range.
+fn key_value(key: &[u8], salt: u64, height: u64) -> u128 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ salt.wrapping_mul(0x1_0000_0001_b3);
+    for &b in key {
+        h = (h ^ b as u64).wrapping_mul(0x1_0000_0001_b3);
+    }
+    match h % 3 {
+        0 => height.saturating_sub((h >> 8) % 210_000) as u128, // near/below tip
+        1 => ((h >> 8) % 1024) as u128,                         // small
+        _ => ((h >> 8) as u128) % (height.max(1) as u128),      // spread
+    }
+}
+
+/// Merge per-world observations `(predicate trace, result)` into one expression.
+///
+/// If every result is identical, that single expression is the plan. Otherwise
+/// find a predicate that appears in *every* trace and is taken both ways across
+/// the set, partition on it, recursively merge each side, and combine as
+/// `if(pred, then, else)`. Predicates that don't cleanly separate the results
+/// are skipped; if none separates them, the set is unmergeable (`None`) and the
+/// view falls back to simulate. Everything here is still verified downstream, so
+/// an over-eager merge is caught rather than shipped.
+fn merge_observations(obs: &[(Vec<(BoolExpr, bool)>, BytesExpr)], depth: usize) -> Option<BytesExpr> {
+    if obs.is_empty() || depth > 16 {
+        return None;
+    }
+    let first = &obs[0].1;
+    if obs.iter().all(|(_, r)| r == first) {
+        return Some(first.clone());
+    }
+    // candidate split predicates: the union of all predicates seen.
+    let mut candidates: Vec<BoolExpr> = Vec::new();
+    for (trace, _) in obs {
+        for (p, _) in trace {
+            if !candidates.contains(p) {
+                candidates.push(p.clone());
+            }
+        }
+    }
+    for pred in &candidates {
+        let mut t: Vec<(Vec<(BoolExpr, bool)>, BytesExpr)> = Vec::new();
+        let mut f: Vec<(Vec<(BoolExpr, bool)>, BytesExpr)> = Vec::new();
+        let mut usable = true;
+        for (trace, result) in obs {
+            match trace.iter().find(|(p, _)| p == pred).map(|(_, b)| *b) {
+                Some(true) => t.push((strip(trace, pred), result.clone())),
+                Some(false) => f.push((strip(trace, pred), result.clone())),
+                None => {
+                    usable = false; // predicate absent here → can't split on it
+                    break;
+                }
+            }
+        }
+        if !usable || t.is_empty() || f.is_empty() {
+            continue;
+        }
+        if let (Some(then), Some(els)) = (
+            merge_observations(&t, depth + 1),
+            merge_observations(&f, depth + 1),
+        ) {
+            if then == els {
+                return Some(then); // predicate didn't actually affect the result
+            }
+            return Some(BytesExpr::If {
+                cond: Box::new(pred.clone()),
+                then: Box::new(then),
+                r#else: Box::new(els),
+            });
+        }
+    }
+    None
+}
+
+fn strip(trace: &[(BoolExpr, bool)], pred: &BoolExpr) -> Vec<(BoolExpr, bool)> {
+    trace.iter().filter(|(p, _)| p != pred).cloned().collect()
 }
 
 struct OracleEnv<'a> {
@@ -100,6 +322,7 @@ pub fn verify_lifted(
     expr: &BytesExpr,
     trials: u32,
     seed: u64,
+    widths: &Widths,
 ) -> Option<u32> {
     let mut rng = Rng::new(seed);
     let mut checked = 0u32;
@@ -118,12 +341,13 @@ pub fn verify_lifted(
             return None;
         }
         for k in &probe.keys {
-            // random value, occasionally empty (to exercise unset reads)
+            // random value, occasionally empty (to exercise unset reads),
+            // truncated to the key's discovered width so its fixed-width
+            // deserializer doesn't panic (mirrors how the lift ran).
             if rng.next_u64() % 5 != 0 {
-                oracle
-                    .storage
-                    .entry(k.clone())
-                    .or_insert_with(|| rng.value_u128().to_le_bytes().to_vec());
+                let w = widths.get(k).copied().unwrap_or(WIDTH_CANDIDATES[0]).min(16);
+                let val = rng.value_u128().to_le_bytes()[..w].to_vec();
+                oracle.storage.entry(k.clone()).or_insert(val);
             }
         }
 
@@ -144,4 +368,58 @@ pub fn verify_lifted(
     }
 
     (checked >= trials).then_some(checked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::NumExpr;
+
+    // `stored_epoch < computed_epoch` — a representative divergence predicate.
+    fn pred() -> BoolExpr {
+        BoolExpr::Lt(Box::new(NumExpr::Height), Box::new(NumExpr::Const(100)))
+    }
+    fn c(b: &[u8]) -> BytesExpr {
+        BytesExpr::Const(b.to_vec())
+    }
+
+    #[test]
+    fn merge_stitches_two_branches() {
+        // one predicate, taken both ways → if(pred, then, else)
+        let obs = vec![
+            (vec![(pred(), true)], c(b"A")),
+            (vec![(pred(), false)], c(b"B")),
+        ];
+        let merged = merge_observations(&obs, 0).expect("should merge");
+        assert_eq!(
+            merged,
+            BytesExpr::If {
+                cond: Box::new(pred()),
+                then: Box::new(c(b"A")),
+                r#else: Box::new(c(b"B")),
+            }
+        );
+    }
+
+    #[test]
+    fn merge_collapses_identical_results() {
+        // every world agrees → single expr, no conditional (the straight-line case)
+        let obs = vec![
+            (vec![(pred(), true)], c(b"X")),
+            (vec![(pred(), false)], c(b"X")),
+            (vec![], c(b"X")),
+        ];
+        assert_eq!(merge_observations(&obs, 0), Some(c(b"X")));
+    }
+
+    #[test]
+    fn merge_rejects_uncaptured_divergence() {
+        // same predicate trace, different results → the split point wasn't
+        // captured, so refuse to merge rather than fabricate a plan.
+        let obs = vec![
+            (vec![(pred(), false)], c(b"A")),
+            (vec![(pred(), false)], c(b"B")),
+        ];
+        assert_eq!(merge_observations(&obs, 0), None);
+    }
 }
