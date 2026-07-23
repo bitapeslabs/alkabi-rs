@@ -61,7 +61,7 @@ impl<'a> Interp<'a> {
                         bail!("unsupported: multivalue if params");
                     }
                     let cond = pop!();
-                    self.record_branch(&cond, cond.c & 0xffff_ffff != 0);
+                    let taken = self.decide(&cond, cond.c & 0xffff_ffff != 0);
                     cs.push(Ctrl {
                         end: ends[&pc],
                         cont: ends[&pc] + 1,
@@ -69,7 +69,7 @@ impl<'a> Interp<'a> {
                         height: vs.len(),
                         is_loop: false,
                     });
-                    if cond.c & 0xffff_ffff == 0 {
+                    if !taken {
                         // false → jump to else body or past end
                         match elses.get(&pc) {
                             Some(&e) => pc = e, // land on Else; +1 below
@@ -104,8 +104,7 @@ impl<'a> Interp<'a> {
                 }
                 Operator::BrIf { relative_depth } => {
                     let c = pop!();
-                    let taken = c.c & 0xffff_ffff != 0;
-                    self.record_branch(&c, taken);
+                    let taken = self.decide(&c, c.c & 0xffff_ffff != 0);
                     if taken {
                         self.do_branch(*relative_depth as usize, &mut vs, &mut cs, &mut pc);
                         continue;
@@ -173,14 +172,20 @@ impl<'a> Interp<'a> {
                     let bv = pop!();
                     let av = pop!();
                     let taken_c = if c.c & 0xffff_ffff != 0 { av.c } else { bv.c };
-                    // capture branchless conditionals: if the selector is a
-                    // symbolic comparison and either branch carries symbolic
-                    // info, produce a conditional value instead of collapsing to
-                    // one side (a boolean-tagged arm counts — a select over
-                    // carries is common in multi-precision arithmetic).
-                    if let Some(cb) = &c.b {
+                    // capture branchless conditionals: if the selector is
+                    // symbolic and either branch carries symbolic info, produce a
+                    // conditional value instead of collapsing to one side. The
+                    // selector counts as symbolic via its boolean tag OR a
+                    // numeric one — a u128 saturating-sub selects on its *borrow*,
+                    // which the word arithmetic yields as a 0/1 number, not a
+                    // bool; missing that drops the saturation guard entirely.
+                    let sel: Option<Rc<SymBool>> = c.b.clone().or_else(|| {
+                        c.s.as_ref()
+                            .map(|s| SymBool::Ne(s.clone(), SymNum::Const(0).rc()).rc())
+                    });
+                    if let Some(sb) = sel {
                         if av.is_symbolic() || bv.is_symbolic() {
-                            let s = SymNum::If(cb.clone(), av.as_sym(), bv.as_sym()).rc();
+                            let s = SymNum::If(sb, av.as_sym(), bv.as_sym()).rc();
                             vs.push(Value::num(taken_c, Some(s)));
                             pc += 1;
                             continue;

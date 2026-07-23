@@ -88,6 +88,7 @@ pub fn lift_view(module: &Module, opcode: u128, arg_count: usize) -> Vec<(BytesE
     }
     freq.sort_by(|a, b| b.1.cmp(&a.1));
 
+    let branchy = freq.len() > 1;
     let mut candidates: Vec<(BytesExpr, Widths)> = Vec::new();
     for (expr, _) in freq.into_iter().take(6) {
         candidates.push((sym::simplify_bytes(expr), widths.clone()));
@@ -96,6 +97,16 @@ pub fn lift_view(module: &Module, opcode: u128, arg_count: usize) -> Vec<(BytesE
         let merged = sym::simplify_bytes(merged);
         if !candidates.iter().any(|(e, _)| *e == merged) {
             candidates.push((merged, widths.clone()));
+        }
+    }
+    // A branchy view whose paths the single-run observations couldn't stitch
+    // needs the full decision tree — recover it by concolic path forking. Gated
+    // on branchiness so straight-line views (one distinct result) skip the cost.
+    if branchy {
+        for cand in explore_view(module, opcode, arg_count) {
+            if !candidates.iter().any(|(e, _)| *e == cand.0) {
+                candidates.push(cand);
+            }
         }
     }
     candidates
@@ -147,8 +158,58 @@ fn collect_observations(
             obs.push(o);
         }
     }
+    // 3) Small-height worlds with small values — every stored value in [0,height]
+    //    against a low tip. This is the regime that keeps height-derived
+    //    quantities *in range* (epoch small, `height - stored_height` positive
+    //    and modest), so the "live" arithmetic paths — read a counter, subtract
+    //    it saturating — are actually taken, both above and below the saturation
+    //    threshold. Random large-height worlds almost never land this.
+    for salt in 0..16u64 {
+        let height = [64u64, 200, 1000, 8000, 100_000, 300_000][(salt as usize) % 6];
+        if let Some(o) = run_world(
+            module,
+            opcode,
+            arg_count,
+            height,
+            |key| (fnv(key, salt) as u128) % (height as u128 + 1),
+            &widths,
+            &cand_idx,
+        ) {
+            obs.push(o);
+        }
+    }
+    // 4) Small stored values against a full-range tip. A stored counter well
+    //    below the height-derived one is the "stale" regime — a contract that
+    //    caches a height-derived quantity and recomputes it when the cache lags
+    //    only takes its recompute branch here. Different `cap`s straddle the
+    //    threshold both ways.
+    for salt in 0..16u64 {
+        let height = [HEIGHT, 500_000, 1_000_000, 210_001][(salt as usize) % 4];
+        let cap = [3u128, 8, 20, 64, 200, 5000][(salt as usize) % 6];
+        if let Some(o) = run_world(
+            module,
+            opcode,
+            arg_count,
+            height,
+            |key| (fnv(key, salt.wrapping_add(777)) as u128) % (cap + 1),
+            &widths,
+            &cand_idx,
+        ) {
+            obs.push(o);
+        }
+    }
     let discovered = widths.borrow().clone();
     (obs, discovered)
+}
+
+/// FNV-1a of `key` mixed with `salt` — a cheap deterministic per-(key,world)
+/// value source for the oracle sweeps.
+fn fnv(key: &[u8], salt: u64) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ salt.wrapping_mul(0x1_0000_0001_b3);
+    for &b in key {
+        h = (h ^ b as u64).wrapping_mul(0x1_0000_0001_b3);
+    }
+    h
 }
 
 /// Run one oracle world with greedy per-key width discovery. Returns the lifted
@@ -219,15 +280,231 @@ fn run_world<F: Fn(&[u8]) -> u128>(
 /// sometimes just below the tip (so a genesis/height-typed key yields a small,
 /// live epoch), sometimes small, sometimes spread across the range.
 fn key_value(key: &[u8], salt: u64, height: u64) -> u128 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ salt.wrapping_mul(0x1_0000_0001_b3);
-    for &b in key {
-        h = (h ^ b as u64).wrapping_mul(0x1_0000_0001_b3);
-    }
+    let h = fnv(key, salt);
     match h % 3 {
         0 => height.saturating_sub((h >> 8) % 210_000) as u128, // near/below tip
         1 => ((h >> 8) % 1024) as u128,                         // small
         _ => ((h >> 8) as u128) % (height.max(1) as u128),      // spread
     }
+}
+
+/*───────────────────────── multi-path exploration ─────────────────────────*/
+
+/// Recover the FULL decision tree of a branchy view (`if(p0, if(p1, …), …)`) by
+/// bounded concolic path forking. A single concrete run only lifts one path;
+/// here every symbolic `if`/`br_if` is walked both ways by deterministic
+/// re-execution with forced branch directions ([`Interp::set_forced`]). Because
+/// the plan is verified against the bytecode afterwards, any path whose forced
+/// concrete state went inconsistent (or an infeasible predicate combination)
+/// simply loses — an over-eager tree is rejected, never shipped.
+///
+/// Returns candidate `(tree, widths)` pairs for the caller to verify. Empty if
+/// nothing lifted.
+fn explore_view(module: &Module, opcode: u128, arg_count: usize) -> Vec<(BytesExpr, Widths)> {
+    const HEIGHT: u64 = 880_001;
+    // A DIVERSE oracle pool. No single concrete world reaches every branch (a
+    // branch guarded by `epoch_start > tip` is dead where values are small, and
+    // vice-versa), and forcing a branch against a world that contradicts it
+    // traps. So exploration draws from a pool: at each fork, whichever oracle
+    // takes the wanted direction *naturally* supplies the live run. The regimes
+    // span small in-range values, large/overflowing values, and small-vs-large
+    // tips so that both sides of every guard are covered by someone.
+    let specs: &[(u64, u128)] = &[
+        (HEIGHT, 8),
+        (HEIGHT, 64),
+        (HEIGHT, 1000),
+        (HEIGHT, 3_000_000),
+        (1_000_000, 20),
+        (500_000, 5),
+        (200, 50),
+        (200, 4000),
+        (1000, 8),
+        (8000, 200),
+        (300_000, 2_000_000),
+        (2_000_000, 5),
+    ];
+    let mut pool: Vec<ExOracle> = specs
+        .iter()
+        .enumerate()
+        .map(|(i, &(h, cap))| {
+            let f: Box<dyn Fn(&[u8]) -> u128> =
+                Box::new(move |key: &[u8]| (fnv(key, i as u64 ^ 0xa5a5) as u128) % (cap + 1));
+            (h, f)
+        })
+        .collect();
+    // Per-key binary-scale oracles: each key is independently tiny (a small
+    // counter — drives "stale"/recompute branches) or above the tip (drives
+    // saturation/overflow). Different splits put different keys on each side, so
+    // combinations a single uniform cap can't produce (e.g. one counter stale
+    // *and* another past the tip) are reached by some oracle.
+    for split in 0..6u64 {
+        let f: Box<dyn Fn(&[u8]) -> u128> = Box::new(move |key: &[u8]| {
+            if fnv(key, split ^ 0x9e37) & 1 == 0 {
+                (fnv(key, split) % 64) as u128
+            } else {
+                HEIGHT as u128 + (fnv(key, split) % 2_000_000) as u128
+            }
+        });
+        pool.push((HEIGHT, f));
+    }
+
+    let widths: RefCell<Widths> = RefCell::new(HashMap::new());
+    let cand_idx: RefCell<HashMap<Vec<u8>, usize>> = RefCell::new(HashMap::new());
+    // Cap exploration near the shippable-tree bound: a view whose tree would run
+    // past this has too many interacting paths to capture completely, so bail
+    // rather than spend runs building something we'd discard anyway.
+    let mut budget = MAX_TREE_NODES + 200;
+    match explore(module, opcode, arg_count, &pool, Vec::new(), &widths, &cand_idx, &mut budget) {
+        // A tree this large is a view with too many interacting paths to capture
+        // completely (and would bloat the ABI even if it verified) — leave it to
+        // simulate rather than probe-verify a monster.
+        Some(tree) if tree_size(&tree) <= MAX_TREE_NODES => {
+            vec![(sym::simplify_bytes(tree), widths.borrow().clone())]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Node budget for a shippable decision tree (bounds ABI size + verify cost).
+const MAX_TREE_NODES: usize = 2000;
+
+fn tree_size(e: &BytesExpr) -> usize {
+    match e {
+        BytesExpr::If { then, r#else, .. } => 1 + tree_size(then) + tree_size(r#else),
+        _ => 1,
+    }
+}
+
+/// One exploration oracle: a tip height and a per-key value source.
+type ExOracle = (u64, Box<dyn Fn(&[u8]) -> u128>);
+
+/// DFS one subtree: run the path under `forced`, and if a symbolic branch lies
+/// beyond the forced prefix (the frontier), recurse into both of its sides and
+/// combine as `if(frontier, then, else)`.
+#[allow(clippy::too_many_arguments)]
+fn explore(
+    module: &Module,
+    opcode: u128,
+    arg_count: usize,
+    pool: &[ExOracle],
+    forced: Vec<bool>,
+    widths: &RefCell<Widths>,
+    cand_idx: &RefCell<HashMap<Vec<u8>, usize>>,
+    budget: &mut usize,
+) -> Option<BytesExpr> {
+    if *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+    let (path, result) = run_path(module, opcode, arg_count, pool, &forced, widths, cand_idx)?;
+    // No symbolic branch past the forced prefix → this path is a leaf.
+    if path.len() <= forced.len() {
+        return Some(result);
+    }
+    // The frontier branch (first unforced symbolic branch). If it can't be
+    // expressed in the plan IR, don't fork — treat the run as a leaf.
+    let Some(cond) = path[forced.len()].0.clone() else {
+        return Some(result);
+    };
+    let mut ft = forced.clone();
+    ft.push(true);
+    let mut ff = forced;
+    ff.push(false);
+    let then = explore(module, opcode, arg_count, pool, ft, widths, cand_idx, budget);
+    let els = explore(module, opcode, arg_count, pool, ff, widths, cand_idx, budget);
+    match (then, els) {
+        (Some(t), Some(f)) if t == f => Some(t), // branch didn't affect the result
+        (Some(t), Some(f)) => Some(BytesExpr::If {
+            cond: Box::new(cond),
+            then: Box::new(t),
+            r#else: Box::new(f),
+        }),
+        // A fork went dead under *every* oracle in the pool: genuinely infeasible
+        // (no input reaches it) or unsupported. Substituting the live side would
+        // fabricate a wrong tree (e.g. dropping a saturation guard), so bail.
+        _ => None,
+    }
+}
+
+/// Run one path under `forced`, trying each pool oracle in turn: a forced
+/// direction that traps under one oracle's concrete state may be live under
+/// another (the symbolic result is oracle-independent, so any live run is
+/// authoritative). Returns the lowered predicate trace (position-aligned with
+/// the forced indices) and the lifted result.
+fn run_path(
+    module: &Module,
+    opcode: u128,
+    arg_count: usize,
+    pool: &[ExOracle],
+    forced: &[bool],
+    widths: &RefCell<Widths>,
+    cand_idx: &RefCell<HashMap<Vec<u8>, usize>>,
+) -> Option<(Vec<(Option<BoolExpr>, bool)>, BytesExpr)> {
+    for (height, val) in pool {
+        if let Some(r) = run_path_one(module, opcode, arg_count, *height, val, forced, widths, cand_idx)
+        {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// Run one path under `forced` against a single oracle (with per-key width
+/// discovery). `None` if it trapped / disqualified / couldn't lower.
+#[allow(clippy::too_many_arguments)]
+fn run_path_one<F: Fn(&[u8]) -> u128>(
+    module: &Module,
+    opcode: u128,
+    arg_count: usize,
+    height: u64,
+    value_of: &F,
+    forced: &[bool],
+    widths: &RefCell<Widths>,
+    cand_idx: &RefCell<HashMap<Vec<u8>, usize>>,
+) -> Option<(Vec<(Option<BoolExpr>, bool)>, BytesExpr)> {
+    let order: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::new());
+    let max_attempts = 2 * WIDTH_CANDIDATES.len() + 12;
+    for _ in 0..max_attempts {
+        order.borrow_mut().clear();
+        let storage = |key: &[u8]| -> Vec<u8> {
+            order.borrow_mut().push(key.to_vec());
+            let w = widths.borrow().get(key).copied().unwrap_or(WIDTH_CANDIDATES[0]);
+            value_of(key).to_le_bytes()[..w.min(16)].to_vec()
+        };
+        let (context, calldata_off) = context_bytes(opcode, arg_count);
+        let env = LiftEnv {
+            context,
+            calldata_off,
+            height,
+            storage: &storage,
+        };
+        let mut interp = Interp::new(module, &env, 5_000_000);
+        interp.set_forced(forced.to_vec());
+        match interp.run_execute() {
+            LiftOutcome::Data(sym) => {
+                let expr = sym::simplify_bytes(sym.lower()?);
+                let path = interp
+                    .take_path()
+                    .into_iter()
+                    .map(|(b, dir)| (b.lower(), dir))
+                    .collect();
+                return Some((path, expr));
+            }
+            LiftOutcome::Trap(_) => {
+                let k = order.borrow().last().cloned()?;
+                let next = cand_idx.borrow().get(&k).map_or(1, |i| i + 1);
+                match WIDTH_CANDIDATES.get(next) {
+                    Some(&w) => {
+                        cand_idx.borrow_mut().insert(k.clone(), next);
+                        widths.borrow_mut().insert(k, w);
+                    }
+                    None => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Merge per-world observations `(predicate trace, result)` into one expression.

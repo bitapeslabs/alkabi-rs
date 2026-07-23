@@ -87,12 +87,18 @@ pub struct Interp<'a> {
     /// key SymBytes remembered between __request_storage and __load_storage
     pending_key: Option<Rc<SymBytes>>,
     disq: Option<&'static str>,
-    /// Control-flow branch predicates taken this run, in order — recorded at
-    /// every `if`/`br_if` whose condition carried a symbolic bool. Multiple runs
-    /// over different oracle worlds take different branches; comparing their
-    /// (predicate, taken) traces is what lets the driver merge divergent paths
-    /// into a single `if(cond, …)` plan.
+    /// Symbolic control-flow branches taken this run, in order — one entry per
+    /// `if`/`br_if` whose condition carried a symbolic bool, holding the
+    /// predicate and the direction taken. The predicate sequence is the path the
+    /// merge / path-exploration driver reasons about.
     path: Vec<(Rc<SymBool>, bool)>,
+    /// Forced directions for symbolic branches, by index. When the k-th symbolic
+    /// branch is reached and `k < forced.len()`, the run takes `forced[k]`
+    /// instead of the concrete direction — this is how [`explore`] walks both
+    /// sides of a branch by deterministic re-execution (concolic path forking).
+    /// Branches past the forced prefix follow their concrete value (and the
+    /// first such is the exploration frontier).
+    forced: Vec<bool>,
 }
 
 /// Cap on recorded branch predicates — guards against a symbolic byte-validation
@@ -129,7 +135,14 @@ impl<'a> Interp<'a> {
             pending_key: None,
             disq: None,
             path: Vec::new(),
+            forced: Vec::new(),
         }
+    }
+
+    /// Force the first `forced.len()` symbolic branches to the given directions
+    /// (for path exploration). Must be set before `run_execute`.
+    pub fn set_forced(&mut self, forced: Vec<bool>) {
+        self.forced = forced;
     }
 
     /// The branch predicates taken this run (see [`Interp::path`]).
@@ -137,15 +150,30 @@ impl<'a> Interp<'a> {
         std::mem::take(&mut self.path)
     }
 
-    /// Record a taken branch if its condition was symbolic (concrete branches
-    /// are world-invariant and carry no plan information).
-    fn record_branch(&mut self, cond: &Value, taken: bool) {
-        if self.path.len() >= MAX_PATH {
-            return;
+    /// Resolve a branch's direction. Concrete conditions follow their value and
+    /// aren't recorded (world-invariant). A symbolic condition is recorded, and
+    /// its direction is overridden by `forced` when within the forced prefix —
+    /// this is what lets [`explore`] re-execute down the other side of a branch.
+    ///
+    /// A condition is symbolic if it carries a boolean tag OR a numeric one: a
+    /// u128 comparison is lowered by the compiler to a word-select yielding a
+    /// 0/1 *number* (not a bool), so `br_if`-ing on it must still count as a
+    /// symbolic branch (`value != 0`), else the branch it guards is invisible.
+    fn decide(&mut self, cond: &Value, concrete: bool) -> bool {
+        let pred: Option<Rc<SymBool>> = match (&cond.b, &cond.s) {
+            (Some(b), _) => Some(b.clone()),
+            (None, Some(s)) => Some(SymBool::Ne(s.clone(), SymNum::Const(0).rc()).rc()),
+            (None, None) => None,
+        };
+        let Some(pred) = pred else {
+            return concrete;
+        };
+        let k = self.path.len();
+        let dir = self.forced.get(k).copied().unwrap_or(concrete);
+        if k < MAX_PATH {
+            self.path.push((pred, dir));
         }
-        if let Some(b) = &cond.b {
-            self.path.push((b.clone(), taken));
-        }
+        dir
     }
 
     pub fn run_execute(&mut self) -> LiftOutcome {
