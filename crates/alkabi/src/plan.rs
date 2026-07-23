@@ -75,6 +75,14 @@ pub enum NumExpr {
     Mul(Box<NumExpr>, Box<NumExpr>),
     Div(Box<NumExpr>, Box<NumExpr>),
     Mod(Box<NumExpr>, Box<NumExpr>),
+    /// Bitwise / shift, matching the wasm integer ops (u128 semantics; shift
+    /// amount ≥ 128 yields 0). Needed to lower lifted computations like
+    /// `base >> halving_epoch`.
+    Shr(Box<NumExpr>, Box<NumExpr>),
+    Shl(Box<NumExpr>, Box<NumExpr>),
+    And(Box<NumExpr>, Box<NumExpr>),
+    Or(Box<NumExpr>, Box<NumExpr>),
+    Xor(Box<NumExpr>, Box<NumExpr>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +228,11 @@ impl NumExpr {
             NumExpr::Mul(a, b) => write_num_pair(out, "mul", a, b),
             NumExpr::Div(a, b) => write_num_pair(out, "div", a, b),
             NumExpr::Mod(a, b) => write_num_pair(out, "mod", a, b),
+            NumExpr::Shr(a, b) => write_num_pair(out, "shr", a, b),
+            NumExpr::Shl(a, b) => write_num_pair(out, "shl", a, b),
+            NumExpr::And(a, b) => write_num_pair(out, "and", a, b),
+            NumExpr::Or(a, b) => write_num_pair(out, "or", a, b),
+            NumExpr::Xor(a, b) => write_num_pair(out, "xor", a, b),
         }
     }
 }
@@ -442,6 +455,19 @@ pub fn eval_num(expr: &NumExpr, env: &mut dyn PlanEnv, var: Option<u128>) -> Res
             }
             Ok(eval_num(a, env, var)? % d)
         }
+        NumExpr::Shr(a, b) => {
+            let sh = eval_num(b, env, var)?;
+            let a = eval_num(a, env, var)?;
+            Ok(if sh >= 128 { 0 } else { a >> sh })
+        }
+        NumExpr::Shl(a, b) => {
+            let sh = eval_num(b, env, var)?;
+            let a = eval_num(a, env, var)?;
+            Ok(if sh >= 128 { 0 } else { a.wrapping_shl(sh as u32) })
+        }
+        NumExpr::And(a, b) => Ok(eval_num(a, env, var)? & eval_num(b, env, var)?),
+        NumExpr::Or(a, b) => Ok(eval_num(a, env, var)? | eval_num(b, env, var)?),
+        NumExpr::Xor(a, b) => Ok(eval_num(a, env, var)? ^ eval_num(b, env, var)?),
     }
 }
 
@@ -617,6 +643,11 @@ mod parse {
             ("mul", NumExpr::Mul),
             ("div", NumExpr::Div),
             ("mod", NumExpr::Mod),
+            ("shr", NumExpr::Shr),
+            ("shl", NumExpr::Shl),
+            ("and", NumExpr::And),
+            ("or", NumExpr::Or),
+            ("xor", NumExpr::Xor),
         ] {
             if let Some(inner) = obj.get(op) {
                 let (a, b) = pair(inner)?;

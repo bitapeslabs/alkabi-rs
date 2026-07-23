@@ -8,7 +8,7 @@ description = "Self-describing ABI generation for alkanes contracts"
 default = []
 # Host-side ABI extraction: wasm bytes -> AlkabiAbi. Never enable in contract
 # builds; it pulls a wasm interpreter and serde_json.
-extract = ["dep:wasmi", "dep:serde_json"]
+extract = ["dep:wasmi", "dep:wasmparser", "dep:serde_json"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -19,6 +19,8 @@ alkanes-runtime = { workspace = true }
 metashrew-support = { workspace = true }
 alkabi-macros = { path = "../alkabi-macros" }
 wasmi = { version = "0.40", optional = true }
+# Direct decoder for the concolic lifter (already in the tree via wasmi).
+wasmparser = { version = "0.221", optional = true }
 # preserve_order: borsh struct field order is wire-significant.
 # arbitrary_precision: opcodes are u128 and must survive JSON round-trips.
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"], optional = true }

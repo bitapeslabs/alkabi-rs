@@ -16,6 +16,7 @@
 
 pub mod fit;
 pub mod host;
+pub mod lift;
 pub mod list;
 pub mod synth;
 pub mod verify;
@@ -64,6 +65,7 @@ pub fn synthesize_one(
     opcode: u128,
     arg_count: usize,
     config: &AnalysisConfig,
+    lift_module: Option<&lift::module::Module>,
 ) -> Option<Plan> {
     // Data-dependent list reads (a `.../length` + decimal-indexed elements,
     // concatenated) have a variable key set the generic path rejects — try the
@@ -92,6 +94,25 @@ pub fn synthesize_one(
             return Some(Plan { expr, trials });
         }
     }
+
+    // Last resort: symbolically lift the wasm computation directly. Covers
+    // arbitrary straight-line pure arithmetic the templates don't (halvings,
+    // bit math, packed layouts). Verbose but correct; verified like the rest.
+    if let Some(lifted) = lift_module.and_then(|m| lift::lift_view(m, opcode, arg_count)) {
+        if let Some(trials) = lift::verify_lifted(
+            prober,
+            opcode,
+            arg_count,
+            &lifted,
+            config.verify_trials,
+            config.verify_seed ^ opcode as u64 ^ 0x11f7,
+        ) {
+            return Some(Plan {
+                expr: lifted,
+                trials,
+            });
+        }
+    }
     None
 }
 
@@ -103,13 +124,17 @@ pub fn attach_plans(
     config: &AnalysisConfig,
 ) -> anyhow::Result<()> {
     let prober = Prober::new(wasm, config.fuel)?;
+    // Parse once for the symbolic lifter (best-effort; None disables lifting).
+    let lift_module = lift::module::Module::parse(wasm).ok();
 
     for method in document.methods.iter_mut() {
         if method.kind != MethodKind::View || method.plan.is_some() {
             continue;
         }
         let arg_count = assumed_arg_count(method);
-        if let Some(plan) = synthesize_one(&prober, method.opcode, arg_count, config) {
+        if let Some(plan) =
+            synthesize_one(&prober, method.opcode, arg_count, config, lift_module.as_ref())
+        {
             method.plan = Some(plan);
         }
     }

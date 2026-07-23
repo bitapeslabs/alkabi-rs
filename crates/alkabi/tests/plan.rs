@@ -184,10 +184,10 @@ fn synthesizes_clockin_plans_if_wasm_present() {
     };
 
     // getCounter (104) and getHeight (102) must both reduce to plans.
-    let counter = synthesize_one(&prober, 104, 0, &config);
+    let counter = synthesize_one(&prober, 104, 0, &config, None);
     assert!(counter.is_some(), "getCounter should synthesize a plan");
     assert!(counter.unwrap().trials >= 64);
 
-    let height = synthesize_one(&prober, 102, 0, &config);
+    let height = synthesize_one(&prober, 102, 0, &config, None);
     assert!(height.is_some(), "getHeight should synthesize a plan");
 }
