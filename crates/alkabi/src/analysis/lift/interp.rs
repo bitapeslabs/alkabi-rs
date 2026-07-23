@@ -37,9 +37,24 @@ impl Value {
     fn boolean(c: u64, b: Option<Rc<SymBool>>) -> Value {
         Value { c, s: None, b }
     }
-    /// The value's symbolic number, materializing a concrete constant if untagged.
+    /// The value's symbolic number. A comparison result carries a boolean tag
+    /// but no numeric tag; when it's consumed as a number (a multi-precision
+    /// carry `(sum < a) as u64`, say) it must stay symbolic as `If(cond,1,0)`,
+    /// not collapse to its concrete 0/1 — otherwise the surrounding arithmetic's
+    /// structure would depend on the concrete input. Falls back to a constant
+    /// only when the value is genuinely untagged.
     fn as_sym(&self) -> Rc<SymNum> {
-        self.s.clone().unwrap_or_else(|| SymNum::Const(self.c as u128).rc())
+        if let Some(s) = &self.s {
+            return s.clone();
+        }
+        if let Some(b) = &self.b {
+            return SymNum::If(b.clone(), SymNum::Const(1).rc(), SymNum::Const(0).rc()).rc();
+        }
+        SymNum::Const(self.c as u128).rc()
+    }
+    /// Whether the value carries any symbolic information (numeric or boolean).
+    fn is_symbolic(&self) -> bool {
+        self.s.is_some() || self.b.is_some()
     }
 }
 

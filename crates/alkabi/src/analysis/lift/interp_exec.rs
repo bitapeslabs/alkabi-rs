@@ -174,10 +174,12 @@ impl<'a> Interp<'a> {
                     let av = pop!();
                     let taken_c = if c.c & 0xffff_ffff != 0 { av.c } else { bv.c };
                     // capture branchless conditionals: if the selector is a
-                    // symbolic comparison and a branch is symbolic, produce a
-                    // conditional value instead of collapsing to one side.
+                    // symbolic comparison and either branch carries symbolic
+                    // info, produce a conditional value instead of collapsing to
+                    // one side (a boolean-tagged arm counts — a select over
+                    // carries is common in multi-precision arithmetic).
                     if let Some(cb) = &c.b {
-                        if av.s.is_some() || bv.s.is_some() {
+                        if av.is_symbolic() || bv.is_symbolic() {
                             let s = SymNum::If(cb.clone(), av.as_sym(), bv.as_sym()).rc();
                             vs.push(Value::num(taken_c, Some(s)));
                             pc += 1;
@@ -410,14 +412,14 @@ impl<'a> Interp<'a> {
                 vs.pop().ok_or_else(|| anyhow!("num underflow"))?
             };
         }
-        // symbolic binop: Some(expr) if either operand is symbolic
-        let sbin = |a: &Value, b: &Value, mask: u64, f: fn(Rc<SymNum>, Rc<SymNum>) -> SymNum| {
-            if a.s.is_none() && b.s.is_none() {
+        // symbolic binop: Some(expr) if either operand carries symbolic info
+        // (numeric OR boolean — a comparison result used as a number stays
+        // symbolic via as_sym's If(cond,1,0), so carries don't leak concretely).
+        let sbin = |a: &Value, b: &Value, _mask: u64, f: fn(Rc<SymNum>, Rc<SymNum>) -> SymNum| {
+            if !a.is_symbolic() && !b.is_symbolic() {
                 return None;
             }
-            let sa = a.s.clone().unwrap_or_else(|| SymNum::Const((a.c & mask) as u128).rc());
-            let sb = b.s.clone().unwrap_or_else(|| SymNum::Const((b.c & mask) as u128).rc());
-            Some(f(sa, sb).rc())
+            Some(f(a.as_sym(), b.as_sym()).rc())
         };
         const M32: u64 = 0xffff_ffff;
         const M64: u64 = u64::MAX;
@@ -451,6 +453,34 @@ impl<'a> Interp<'a> {
                 let a = pop!();
                 let c = $f(a.c, b.c);
                 vs.push(Value::con(c));
+                Ok(true)
+            }};
+        }
+        // Like bin32!/bin64! but wraps the symbolic result to the type width.
+        // The plan IR is u128, yet wasm i32/i64 arithmetic wraps at 2^32 / 2^64,
+        // so Add/Sub/Mul/Shl — the ops that can carry past the type width — must
+        // mask their symbolic result to stay faithful. Without this the 32-bit-
+        // limb u128 multiply's partial products overflow the plan's u128 and the
+        // lifted plan no longer matches the bytecode.
+        macro_rules! bin32w {
+            ($f:expr, $sym:expr) => {{
+                let b = pop!();
+                let a = pop!();
+                let c = ($f(a.c as u32, b.c as u32) as u64) & M32;
+                let s = sbin(&a, &b, M32, $sym)
+                    .map(|x| SymNum::And(x, SymNum::Const(M32 as u128).rc()).rc());
+                vs.push(Value::num(c, s));
+                Ok(true)
+            }};
+        }
+        macro_rules! bin64w {
+            ($f:expr, $sym:expr) => {{
+                let b = pop!();
+                let a = pop!();
+                let c = $f(a.c, b.c);
+                let s = sbin(&a, &b, M64, $sym)
+                    .map(|x| SymNum::And(x, SymNum::Const(M64 as u128).rc()).rc());
+                vs.push(Value::num(c, s));
                 Ok(true)
             }};
         }
@@ -495,9 +525,9 @@ impl<'a> Interp<'a> {
         use SymNum::*;
         match op {
             // i32 arithmetic
-            Operator::I32Add => bin32!(|a: u32, b: u32| a.wrapping_add(b), |a, b| Add(a, b)),
-            Operator::I32Sub => bin32!(|a: u32, b: u32| a.wrapping_sub(b), |a, b| Sub(a, b)),
-            Operator::I32Mul => bin32!(|a: u32, b: u32| a.wrapping_mul(b), |a, b| Mul(a, b)),
+            Operator::I32Add => bin32w!(|a: u32, b: u32| a.wrapping_add(b), |a, b| Add(a, b)),
+            Operator::I32Sub => bin32w!(|a: u32, b: u32| a.wrapping_sub(b), |a, b| Sub(a, b)),
+            Operator::I32Mul => bin32w!(|a: u32, b: u32| a.wrapping_mul(b), |a, b| Mul(a, b)),
             Operator::I32DivU => {
                 let b = pop!();
                 let a = pop!();
@@ -523,15 +553,15 @@ impl<'a> Interp<'a> {
             Operator::I32And => bin32!(|a: u32, b: u32| a & b, |a, b| And(a, b)),
             Operator::I32Or => bin32!(|a: u32, b: u32| a | b, |a, b| Or(a, b)),
             Operator::I32Xor => bin32!(|a: u32, b: u32| a ^ b, |a, b| Xor(a, b)),
-            Operator::I32Shl => bin32!(|a: u32, b: u32| a.wrapping_shl(b), |a, b| Shl(a, b)),
+            Operator::I32Shl => bin32w!(|a: u32, b: u32| a.wrapping_shl(b), |a, b| Shl(a, b)),
             Operator::I32ShrU => bin32!(|a: u32, b: u32| a.wrapping_shr(b), |a, b| Shr(a, b)),
             Operator::I32ShrS => bin32!(|a: u32, b: u32| (a as i32).wrapping_shr(b) as u32),
             Operator::I32Rotl => bin32!(|a: u32, b: u32| a.rotate_left(b)),
             Operator::I32Rotr => bin32!(|a: u32, b: u32| a.rotate_right(b)),
             // i64 arithmetic
-            Operator::I64Add => bin64!(|a: u64, b: u64| a.wrapping_add(b), |a, b| Add(a, b)),
-            Operator::I64Sub => bin64!(|a: u64, b: u64| a.wrapping_sub(b), |a, b| Sub(a, b)),
-            Operator::I64Mul => bin64!(|a: u64, b: u64| a.wrapping_mul(b), |a, b| Mul(a, b)),
+            Operator::I64Add => bin64w!(|a: u64, b: u64| a.wrapping_add(b), |a, b| Add(a, b)),
+            Operator::I64Sub => bin64w!(|a: u64, b: u64| a.wrapping_sub(b), |a, b| Sub(a, b)),
+            Operator::I64Mul => bin64w!(|a: u64, b: u64| a.wrapping_mul(b), |a, b| Mul(a, b)),
             Operator::I64DivU => {
                 let b = pop!();
                 let a = pop!();
@@ -555,7 +585,7 @@ impl<'a> Interp<'a> {
             Operator::I64And => bin64!(|a: u64, b: u64| a & b, |a, b| And(a, b)),
             Operator::I64Or => bin64!(|a: u64, b: u64| a | b, |a, b| Or(a, b)),
             Operator::I64Xor => bin64!(|a: u64, b: u64| a ^ b, |a, b| Xor(a, b)),
-            Operator::I64Shl => bin64!(|a: u64, b: u64| a.wrapping_shl(b as u32), |a, b| Shl(a, b)),
+            Operator::I64Shl => bin64w!(|a: u64, b: u64| a.wrapping_shl(b as u32), |a, b| Shl(a, b)),
             Operator::I64ShrU => bin64!(|a: u64, b: u64| a.wrapping_shr(b as u32), |a, b| Shr(a, b)),
             Operator::I64ShrS => bin64!(|a: u64, b: u64| (a as i64).wrapping_shr(b as u32) as u64),
             Operator::I64Rotl => bin64!(|a: u64, b: u64| a.rotate_left(b as u32)),

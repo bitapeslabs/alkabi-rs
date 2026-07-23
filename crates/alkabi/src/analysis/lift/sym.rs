@@ -142,6 +142,12 @@ pub fn simplify_num(e: NumExpr) -> NumExpr {
         And(a, b) => match bin(*a, *b) {
             (Const(0), _) | (_, Const(0)) => Const(0),
             (Const(x), Const(y)) => Const(x & y),
+            // collapse stacked width-masks: (x & m1) & m2 == x & (m1 & m2).
+            // The i64/i32 wrap-masking and word-slice masking pile these up.
+            (And(inner, m1), Const(y)) | (Const(y), And(inner, m1)) if matches!(&*m1, Const(_)) => {
+                let Const(m1v) = *m1 else { unreachable!() };
+                simplify_num(And(inner, Box::new(Const(m1v & y))))
+            }
             (x, y) => And(Box::new(x), Box::new(y)),
         },
         Xor(a, b) => match bin(*a, *b) {
