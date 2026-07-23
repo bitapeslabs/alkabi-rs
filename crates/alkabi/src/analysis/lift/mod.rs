@@ -39,20 +39,37 @@ fn context_bytes(opcode: u128, arg_count: usize) -> (Vec<u8>, usize) {
 
 /// Attempt to lift a plan for `opcode`. Returns the raw (unverified) BytesExpr;
 /// the caller must verify it against the wasm before shipping.
+///
+/// A few storage-value strategies are tried in turn: for straight-line code the
+/// symbolic result is identical regardless, but a view that panics on some
+/// concrete values (e.g. an emission-table index that overflows when a stored
+/// height is far from the tip) may lift cleanly under a different world.
 pub fn lift_view(module: &Module, opcode: u128, arg_count: usize) -> Option<BytesExpr> {
-    let (context, calldata_off) = context_bytes(opcode, arg_count);
-    let storage = |_key: &[u8]| -> Vec<u8> { 7u128.to_le_bytes().to_vec() };
-    let env = LiftEnv {
-        context,
-        calldata_off,
-        height: 880_001,
-        storage: &storage,
-    };
-    let mut interp = Interp::new(module, &env, 5_000_000);
-    match interp.run_execute() {
-        LiftOutcome::Data(sym) => sym.lower().map(sym::simplify_bytes),
-        _ => None,
+    const HEIGHT: u64 = 880_001;
+    // each strategy maps a requested key to a concrete value
+    let strategies: [fn(&[u8]) -> Vec<u8>; 4] = [
+        |_| 7u128.to_le_bytes().to_vec(),
+        |_| 1u128.to_le_bytes().to_vec(),
+        // values near the tip — avoids "blocks since genesis" overflow traps
+        |_| (HEIGHT as u128 - 10).to_le_bytes().to_vec(),
+        |_| 0u128.to_le_bytes().to_vec(),
+    ];
+    for storage in strategies {
+        let (context, calldata_off) = context_bytes(opcode, arg_count);
+        let env = LiftEnv {
+            context,
+            calldata_off,
+            height: HEIGHT,
+            storage: &storage,
+        };
+        let mut interp = Interp::new(module, &env, 5_000_000);
+        if let LiftOutcome::Data(sym) = interp.run_execute() {
+            if let Some(expr) = sym.lower().map(sym::simplify_bytes) {
+                return Some(expr);
+            }
+        }
     }
+    None
 }
 
 struct OracleEnv<'a> {

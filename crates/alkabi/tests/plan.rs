@@ -160,6 +160,32 @@ fn arithmetic_and_division() {
     assert_eq!(eval_plan(&plan, &mut e).unwrap(), 15u128.to_le_bytes());
 }
 
+#[test]
+fn numeric_conditional() {
+    // saturating_sub shape: if a >= b then a - b else 0
+    use alkabi::plan::BoolExpr;
+    let a = || NumExpr::ULe(Box::new(BytesExpr::Storage(Box::new(BytesExpr::Const(b"/a".to_vec())))));
+    let b = || NumExpr::ULe(Box::new(BytesExpr::Storage(Box::new(BytesExpr::Const(b"/b".to_vec())))));
+    let plan = Plan {
+        expr: BytesExpr::Le {
+            of: Box::new(NumExpr::If {
+                cond: Box::new(BoolExpr::Gte(Box::new(a()), Box::new(b()))),
+                then: Box::new(NumExpr::Sub(Box::new(a()), Box::new(b()))),
+                r#else: Box::new(NumExpr::Const(0)),
+            }),
+            width: 16,
+        },
+        trials: 0,
+    };
+    let plan = roundtrip(&plan);
+    // a=100 >= b=30 → 70
+    let mut e = env(&[(b"/a", &100u128.to_le_bytes()), (b"/b", &30u128.to_le_bytes())], 0, vec![]);
+    assert_eq!(eval_plan(&plan, &mut e).unwrap(), 70u128.to_le_bytes());
+    // a=10 < b=30 → 0 (saturates)
+    let mut e2 = env(&[(b"/a", &10u128.to_le_bytes()), (b"/b", &30u128.to_le_bytes())], 0, vec![]);
+    assert_eq!(eval_plan(&plan, &mut e2).unwrap(), 0u128.to_le_bytes());
+}
+
 /// End-to-end: build clock-in fresh (if the toolchain is available) and confirm
 /// synthesis recovers the expected plans, each surviving verification. Skipped
 /// when the wasm isn't present so the suite stays hermetic.

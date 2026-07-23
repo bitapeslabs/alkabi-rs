@@ -8,8 +8,38 @@
 //! stays `None` (concrete) — and only the parts that flow into `response.data`
 //! matter, so untracked scratch computation is harmless.
 
-use crate::plan::{BytesExpr, NumExpr};
+use crate::plan::{BoolExpr, BytesExpr, NumExpr};
 use std::rc::Rc;
+
+/// A symbolic boolean (mirrors `BoolExpr`) — produced by comparisons on
+/// symbolic operands, consumed by `SymNum::If` / branch recording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymBool {
+    Eq(Rc<SymNum>, Rc<SymNum>),
+    Ne(Rc<SymNum>, Rc<SymNum>),
+    Lt(Rc<SymNum>, Rc<SymNum>),
+    Lte(Rc<SymNum>, Rc<SymNum>),
+    Gt(Rc<SymNum>, Rc<SymNum>),
+    Gte(Rc<SymNum>, Rc<SymNum>),
+    Not(Rc<SymBool>),
+}
+
+impl SymBool {
+    pub fn rc(self) -> Rc<SymBool> {
+        Rc::new(self)
+    }
+    pub fn lower(&self) -> Option<BoolExpr> {
+        Some(match self {
+            SymBool::Eq(a, b) => BoolExpr::Eq(Box::new(a.lower()?), Box::new(b.lower()?)),
+            SymBool::Ne(a, b) => BoolExpr::Ne(Box::new(a.lower()?), Box::new(b.lower()?)),
+            SymBool::Lt(a, b) => BoolExpr::Lt(Box::new(a.lower()?), Box::new(b.lower()?)),
+            SymBool::Lte(a, b) => BoolExpr::Lte(Box::new(a.lower()?), Box::new(b.lower()?)),
+            SymBool::Gt(a, b) => BoolExpr::Gt(Box::new(a.lower()?), Box::new(b.lower()?)),
+            SymBool::Gte(a, b) => BoolExpr::Gte(Box::new(a.lower()?), Box::new(b.lower()?)),
+            SymBool::Not(x) => BoolExpr::Not(Box::new(x.lower()?)),
+        })
+    }
+}
 
 /// Constant-fold and simplify a lifted expression: kills the `0 << x`, `0 | y`,
 /// `x + 0`, `le(const)` noise that LLVM's lowering leaves behind, so a lifted
@@ -120,6 +150,19 @@ pub fn simplify_num(e: NumExpr) -> NumExpr {
         },
         ULe(b) => ULe(Box::new(simplify_bytes(*b))),
         Len(b) => Len(Box::new(simplify_bytes(*b))),
+        If { cond, then, r#else } => {
+            let then = simplify_num(*then);
+            let els = simplify_num(*r#else);
+            if then == els {
+                then
+            } else {
+                If {
+                    cond,
+                    then: Box::new(then),
+                    r#else: Box::new(els),
+                }
+            }
+        }
         leaf => leaf,
     }
 }
@@ -155,6 +198,8 @@ pub enum SymNum {
     And(Rc<SymNum>, Rc<SymNum>),
     Or(Rc<SymNum>, Rc<SymNum>),
     Xor(Rc<SymNum>, Rc<SymNum>),
+    /// Branchless conditional (from `select` / saturating arithmetic).
+    If(Rc<SymBool>, Rc<SymNum>, Rc<SymNum>),
 }
 
 /// Provenance of a single memory byte.
@@ -195,6 +240,11 @@ impl SymNum {
             SymNum::And(a, b) => NumExpr::And(Box::new(a.lower()?), Box::new(b.lower()?)),
             SymNum::Or(a, b) => NumExpr::Or(Box::new(a.lower()?), Box::new(b.lower()?)),
             SymNum::Xor(a, b) => NumExpr::Xor(Box::new(a.lower()?), Box::new(b.lower()?)),
+            SymNum::If(c, t, e) => NumExpr::If {
+                cond: Box::new(c.lower()?),
+                then: Box::new(t.lower()?),
+                r#else: Box::new(e.lower()?),
+            },
         })
     }
 }

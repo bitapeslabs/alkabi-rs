@@ -10,7 +10,7 @@
 //! lift is simply discarded.
 
 use super::module::Module;
-use super::sym::{ByteProv, SymBytes, SymNum};
+use super::sym::{ByteProv, SymBool, SymBytes, SymNum};
 use anyhow::{anyhow, bail, Result};
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -22,15 +22,24 @@ const PAGE: usize = 65536;
 struct Value {
     /// Concrete bits (i32 held in the low 32).
     c: u64,
-    /// Symbolic tag, if this value is derived from storage/height/calldata.
+    /// Symbolic numeric tag, if derived from storage/height/calldata.
     s: Option<Rc<SymNum>>,
+    /// Symbolic boolean tag (comparison results), for select/branch capture.
+    b: Option<Rc<SymBool>>,
 }
 impl Value {
     fn con(c: u64) -> Value {
-        Value { c, s: None }
+        Value { c, s: None, b: None }
     }
-    fn sym(c: u64, s: Rc<SymNum>) -> Value {
-        Value { c, s: Some(s) }
+    fn num(c: u64, s: Option<Rc<SymNum>>) -> Value {
+        Value { c, s, b: None }
+    }
+    fn boolean(c: u64, b: Option<Rc<SymBool>>) -> Value {
+        Value { c, s: None, b }
+    }
+    /// The value's symbolic number, materializing a concrete constant if untagged.
+    fn as_sym(&self) -> Rc<SymNum> {
+        self.s.clone().unwrap_or_else(|| SymNum::Const(self.c as u128).rc())
     }
 }
 

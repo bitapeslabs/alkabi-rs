@@ -167,9 +167,21 @@ impl<'a> Interp<'a> {
                 }
                 Operator::Select | Operator::TypedSelect { .. } => {
                     let c = pop!();
-                    let b = pop!();
-                    let a = pop!();
-                    vs.push(if c.c & 0xffff_ffff != 0 { a } else { b });
+                    let bv = pop!();
+                    let av = pop!();
+                    let taken_c = if c.c & 0xffff_ffff != 0 { av.c } else { bv.c };
+                    // capture branchless conditionals: if the selector is a
+                    // symbolic comparison and a branch is symbolic, produce a
+                    // conditional value instead of collapsing to one side.
+                    if let Some(cb) = &c.b {
+                        if av.s.is_some() || bv.s.is_some() {
+                            let s = SymNum::If(cb.clone(), av.as_sym(), bv.as_sym()).rc();
+                            vs.push(Value::num(taken_c, Some(s)));
+                            pc += 1;
+                            continue;
+                        }
+                    }
+                    vs.push(if c.c & 0xffff_ffff != 0 { av } else { bv });
                 }
                 Operator::LocalGet { local_index } => vs.push(locals[*local_index as usize].clone()),
                 Operator::LocalSet { local_index } => {
@@ -312,7 +324,7 @@ impl<'a> Interp<'a> {
             c = (((c << shift) as i64) >> shift) as u64;
         }
         let sym = self.recover_num(a as u32, width as u32);
-        vs.push(Value { c, s: sym });
+        vs.push(Value::num(c, sym));
         Ok(())
     }
 
@@ -381,7 +393,7 @@ impl<'a> Interp<'a> {
                 let b = pop!();
                 let a = pop!();
                 let c = ($f(a.c as u32, b.c as u32) as u64) & M32;
-                vs.push(Value { c, s: sbin(&a, &b, M32, $sym) });
+                vs.push(Value::num(c, sbin(&a, &b, M32, $sym)));
                 Ok(true)
             }};
             ($f:expr) => {{
@@ -397,7 +409,7 @@ impl<'a> Interp<'a> {
                 let b = pop!();
                 let a = pop!();
                 let c = $f(a.c, b.c);
-                vs.push(Value { c, s: sbin(&a, &b, M64, $sym) });
+                vs.push(Value::num(c, sbin(&a, &b, M64, $sym)));
                 Ok(true)
             }};
             ($f:expr) => {{
@@ -408,7 +420,21 @@ impl<'a> Interp<'a> {
                 Ok(true)
             }};
         }
+        // symbolic bool for a comparison, if either operand is symbolic
+        let scmp = |a: &Value, b: &Value, f: fn(Rc<SymNum>, Rc<SymNum>) -> SymBool| {
+            if a.s.is_none() && b.s.is_none() {
+                return None;
+            }
+            Some(f(a.as_sym(), b.as_sym()).rc())
+        };
         macro_rules! cmp32 {
+            ($f:expr, $sym:expr) => {{
+                let b = pop!();
+                let a = pop!();
+                let c = $f(a.c as u32, b.c as u32) as u64;
+                vs.push(Value::boolean(c, scmp(&a, &b, $sym)));
+                Ok(true)
+            }};
             ($f:expr) => {{
                 let b = pop!();
                 let a = pop!();
@@ -417,6 +443,13 @@ impl<'a> Interp<'a> {
             }};
         }
         macro_rules! cmp64 {
+            ($f:expr, $sym:expr) => {{
+                let b = pop!();
+                let a = pop!();
+                let c = $f(a.c, b.c) as u64;
+                vs.push(Value::boolean(c, scmp(&a, &b, $sym)));
+                Ok(true)
+            }};
             ($f:expr) => {{
                 let b = pop!();
                 let a = pop!();
@@ -438,7 +471,7 @@ impl<'a> Interp<'a> {
                     bail!("div by zero");
                 }
                 let c = ((a.c as u32) / (b.c as u32)) as u64;
-                vs.push(Value { c, s: sbin(&a, &b, M32, |a, b| Div(a, b)) });
+                vs.push(Value::num(c, sbin(&a, &b, M32, |a, b| Div(a, b))));
                 Ok(true)
             }
             Operator::I32RemU => {
@@ -448,7 +481,7 @@ impl<'a> Interp<'a> {
                     bail!("rem by zero");
                 }
                 let c = ((a.c as u32) % (b.c as u32)) as u64;
-                vs.push(Value { c, s: sbin(&a, &b, M32, |a, b| Mod(a, b)) });
+                vs.push(Value::num(c, sbin(&a, &b, M32, |a, b| Mod(a, b))));
                 Ok(true)
             }
             Operator::I32DivS => bin32!(|a: u32, b: u32| (a as i32).wrapping_div(b as i32) as u32),
@@ -471,7 +504,7 @@ impl<'a> Interp<'a> {
                 if b.c == 0 {
                     bail!("div by zero");
                 }
-                vs.push(Value { c: a.c / b.c, s: sbin(&a, &b, M64, |a, b| Div(a, b)) });
+                vs.push(Value::num(a.c / b.c, sbin(&a, &b, M64, |a, b| Div(a, b))));
                 Ok(true)
             }
             Operator::I64RemU => {
@@ -480,7 +513,7 @@ impl<'a> Interp<'a> {
                 if b.c == 0 {
                     bail!("rem by zero");
                 }
-                vs.push(Value { c: a.c % b.c, s: sbin(&a, &b, M64, |a, b| Mod(a, b)) });
+                vs.push(Value::num(a.c % b.c, sbin(&a, &b, M64, |a, b| Mod(a, b))));
                 Ok(true)
             }
             Operator::I64DivS => bin64!(|a: u64, b: u64| (a as i64).wrapping_div((b as i64).max(1)) as u64),
@@ -496,33 +529,41 @@ impl<'a> Interp<'a> {
             // comparisons (concrete)
             Operator::I32Eqz => {
                 let a = pop!();
-                vs.push(Value::con((a.c as u32 == 0) as u64));
+                let sb = a
+                    .s
+                    .as_ref()
+                    .map(|s| SymBool::Eq(s.clone(), SymNum::Const(0).rc()).rc());
+                vs.push(Value::boolean((a.c as u32 == 0) as u64, sb));
                 Ok(true)
             }
             Operator::I64Eqz => {
                 let a = pop!();
-                vs.push(Value::con((a.c == 0) as u64));
+                let sb = a
+                    .s
+                    .as_ref()
+                    .map(|s| SymBool::Eq(s.clone(), SymNum::Const(0).rc()).rc());
+                vs.push(Value::boolean((a.c == 0) as u64, sb));
                 Ok(true)
             }
-            Operator::I32Eq => cmp32!(|a: u32, b: u32| a == b),
-            Operator::I32Ne => cmp32!(|a: u32, b: u32| a != b),
-            Operator::I32LtU => cmp32!(|a: u32, b: u32| a < b),
+            Operator::I32Eq => cmp32!(|a: u32, b: u32| a == b, |a, b| SymBool::Eq(a, b)),
+            Operator::I32Ne => cmp32!(|a: u32, b: u32| a != b, |a, b| SymBool::Ne(a, b)),
+            Operator::I32LtU => cmp32!(|a: u32, b: u32| a < b, |a, b| SymBool::Lt(a, b)),
             Operator::I32LtS => cmp32!(|a: u32, b: u32| (a as i32) < (b as i32)),
-            Operator::I32GtU => cmp32!(|a: u32, b: u32| a > b),
+            Operator::I32GtU => cmp32!(|a: u32, b: u32| a > b, |a, b| SymBool::Gt(a, b)),
             Operator::I32GtS => cmp32!(|a: u32, b: u32| (a as i32) > (b as i32)),
-            Operator::I32LeU => cmp32!(|a: u32, b: u32| a <= b),
+            Operator::I32LeU => cmp32!(|a: u32, b: u32| a <= b, |a, b| SymBool::Lte(a, b)),
             Operator::I32LeS => cmp32!(|a: u32, b: u32| (a as i32) <= (b as i32)),
-            Operator::I32GeU => cmp32!(|a: u32, b: u32| a >= b),
+            Operator::I32GeU => cmp32!(|a: u32, b: u32| a >= b, |a, b| SymBool::Gte(a, b)),
             Operator::I32GeS => cmp32!(|a: u32, b: u32| (a as i32) >= (b as i32)),
-            Operator::I64Eq => cmp64!(|a: u64, b: u64| a == b),
-            Operator::I64Ne => cmp64!(|a: u64, b: u64| a != b),
-            Operator::I64LtU => cmp64!(|a: u64, b: u64| a < b),
+            Operator::I64Eq => cmp64!(|a: u64, b: u64| a == b, |a, b| SymBool::Eq(a, b)),
+            Operator::I64Ne => cmp64!(|a: u64, b: u64| a != b, |a, b| SymBool::Ne(a, b)),
+            Operator::I64LtU => cmp64!(|a: u64, b: u64| a < b, |a, b| SymBool::Lt(a, b)),
             Operator::I64LtS => cmp64!(|a: u64, b: u64| (a as i64) < (b as i64)),
-            Operator::I64GtU => cmp64!(|a: u64, b: u64| a > b),
+            Operator::I64GtU => cmp64!(|a: u64, b: u64| a > b, |a, b| SymBool::Gt(a, b)),
             Operator::I64GtS => cmp64!(|a: u64, b: u64| (a as i64) > (b as i64)),
-            Operator::I64LeU => cmp64!(|a: u64, b: u64| a <= b),
+            Operator::I64LeU => cmp64!(|a: u64, b: u64| a <= b, |a, b| SymBool::Lte(a, b)),
             Operator::I64LeS => cmp64!(|a: u64, b: u64| (a as i64) <= (b as i64)),
-            Operator::I64GeU => cmp64!(|a: u64, b: u64| a >= b),
+            Operator::I64GeU => cmp64!(|a: u64, b: u64| a >= b, |a, b| SymBool::Gte(a, b)),
             Operator::I64GeS => cmp64!(|a: u64, b: u64| (a as i64) >= (b as i64)),
             // bit counting (concrete)
             Operator::I32Clz => {
@@ -558,17 +599,17 @@ impl<'a> Interp<'a> {
             // conversions — value preserved (approx), keep symbolic tag
             Operator::I32WrapI64 => {
                 let a = pop!();
-                vs.push(Value { c: a.c & M32, s: a.s });
+                vs.push(Value::num(a.c & M32, a.s));
                 Ok(true)
             }
             Operator::I64ExtendI32U => {
                 let a = pop!();
-                vs.push(Value { c: a.c & M32, s: a.s });
+                vs.push(Value::num(a.c & M32, a.s));
                 Ok(true)
             }
             Operator::I64ExtendI32S => {
                 let a = pop!();
-                vs.push(Value { c: (a.c as u32 as i32 as i64) as u64, s: a.s });
+                vs.push(Value::num((a.c as u32 as i32 as i64) as u64, a.s));
                 Ok(true)
             }
             Operator::I32Extend8S => {

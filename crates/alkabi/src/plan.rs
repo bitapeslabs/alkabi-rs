@@ -83,6 +83,14 @@ pub enum NumExpr {
     And(Box<NumExpr>, Box<NumExpr>),
     Or(Box<NumExpr>, Box<NumExpr>),
     Xor(Box<NumExpr>, Box<NumExpr>),
+    /// Conditional value — the numeric analogue of `BytesExpr::If`. Lets the
+    /// lifter capture branchless conditionals (`select`, `saturating_sub`,
+    /// `min`/`max`) in a single pass.
+    If {
+        cond: Box<BoolExpr>,
+        then: Box<NumExpr>,
+        r#else: Box<NumExpr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +241,15 @@ impl NumExpr {
             NumExpr::And(a, b) => write_num_pair(out, "and", a, b),
             NumExpr::Or(a, b) => write_num_pair(out, "or", a, b),
             NumExpr::Xor(a, b) => write_num_pair(out, "xor", a, b),
+            NumExpr::If { cond, then, r#else } => {
+                out.push_str("{\"nif\":{\"cond\":");
+                cond.write_json(out);
+                out.push_str(",\"then\":");
+                then.write_json(out);
+                out.push_str(",\"else\":");
+                r#else.write_json(out);
+                out.push_str("}}");
+            }
         }
     }
 }
@@ -468,6 +485,13 @@ pub fn eval_num(expr: &NumExpr, env: &mut dyn PlanEnv, var: Option<u128>) -> Res
         NumExpr::And(a, b) => Ok(eval_num(a, env, var)? & eval_num(b, env, var)?),
         NumExpr::Or(a, b) => Ok(eval_num(a, env, var)? | eval_num(b, env, var)?),
         NumExpr::Xor(a, b) => Ok(eval_num(a, env, var)? ^ eval_num(b, env, var)?),
+        NumExpr::If { cond, then, r#else } => {
+            if eval_bool(cond, env, var)? {
+                eval_num(then, env, var)
+            } else {
+                eval_num(r#else, env, var)
+            }
+        }
     }
 }
 
@@ -653,6 +677,13 @@ mod parse {
                 let (a, b) = pair(inner)?;
                 return Ok(build(Box::new(a), Box::new(b)));
             }
+        }
+        if let Some(inner) = obj.get("nif") {
+            return Ok(NumExpr::If {
+                cond: Box::new(parse_bool(inner.get("cond").ok_or_else(|| anyhow!("nif: cond"))?)?),
+                then: Box::new(parse_num(inner.get("then").ok_or_else(|| anyhow!("nif: then"))?)?),
+                r#else: Box::new(parse_num(inner.get("else").ok_or_else(|| anyhow!("nif: else"))?)?),
+            });
         }
         bail!("plan: unrecognized number expression: {}", v)
     }
