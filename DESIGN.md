@@ -196,9 +196,13 @@ already-deployed contracts:
 ```jsonc
 { "name": "getCounter", "opcode": 104, "kind": "view",
   "output": { "mode": "raw", "schema": "u64" },
-  "plan": { "v": 1, "trials": 256,
+  "plan": { "v": 1,
             "expr": { "le": { "of": { "u": { "storage": { "bytes": "2f636f756e746572" } } }, "width": 8 } } } }
 ```
+
+The randomized-trial count every plan survived is uniform across a document's
+plans, so it's recorded **once** as a top-level `"trials"` field on the ABI
+document (alongside `alkabi`/`contract`), not repeated on each method's plan.
 
 The plan grammar (`alkabi::plan`) is three expression kinds — **bytes**
 (`storage(keyExpr)`, `calldata{start,len}`, `concat`, `slice`, `le{of,width}`,

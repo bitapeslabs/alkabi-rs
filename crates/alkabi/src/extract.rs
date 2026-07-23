@@ -168,6 +168,16 @@ fn parse_alkabi_document(value: &Value) -> Result<AbiDocument> {
         methods.push(parse_method(method)?);
     }
 
+    // `trials` lives once at the document level; push it back onto each plan so
+    // the in-memory `Plan` carries its verification count (see plan JSON writer).
+    if let Some(trials) = value.get("trials").and_then(Value::as_u64) {
+        for method in &mut methods {
+            if let Some(plan) = &mut method.plan {
+                plan.trials = trials as u32;
+            }
+        }
+    }
+
     Ok(AbiDocument {
         contract,
         types,

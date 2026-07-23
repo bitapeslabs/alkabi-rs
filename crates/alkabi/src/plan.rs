@@ -320,12 +320,12 @@ impl BoolExpr {
 
 impl Plan {
     pub fn write_json(&self, out: &mut String) {
+        // `trials` is uniform across a document's plans, so it's emitted once at
+        // the document level (see `AbiDocument::to_json`), not per method.
         out.push_str("{\"v\":");
         out.push_str(&PLAN_VERSION.to_string());
         out.push_str(",\"expr\":");
         self.expr.write_json(out);
-        out.push_str(",\"trials\":");
-        out.push_str(&self.trials.to_string());
         out.push('}');
     }
 

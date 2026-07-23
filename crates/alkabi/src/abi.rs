@@ -129,6 +129,12 @@ impl AbiDocument {
         out.push_str(&ALKABI_VERSION.to_string());
         out.push_str(",\"contract\":");
         write_json_string(&mut out, &self.contract);
+        // Document-level: the randomized differential-trial count every plan in
+        // this document survived (uniform, so recorded once, not per method).
+        if let Some(trials) = self.methods.iter().find_map(|m| m.plan.as_ref().map(|p| p.trials)) {
+            out.push_str(",\"trials\":");
+            out.push_str(&trials.to_string());
+        }
         out.push_str(",\"types\":");
         self.types.write_json(&mut out);
         out.push_str(",\"methods\":[");
